@@ -5,6 +5,7 @@ import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongList;
 import net.minecraft.core.BlockPos;
+import org.dreeam.leaf.perf.offheap.OffHeapLongLists;
 
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -26,6 +27,11 @@ import java.util.concurrent.ThreadLocalRandom;
  * </ul>
  * The cache holds a few dozen entries at most, so the copy is a handful of array copies that happen
  * once per distinct (xRange, yRange, zRange) triple - not once per call.
+ * <p>
+ * The position tables themselves are immutable snapshots that live for the whole uptime of the
+ * server, so they are <b>moved off the Java heap</b> ({@link OffHeapLongLists}): the collector stops
+ * scanning them and they do not count towards {@code -Xmx}. Small tables stay on the heap on
+ * purpose - see the comment in {@code OffHeapLongLists}.
  *
  * @author 2No2Name, original implementation by SuperCoder7979 and Gegy1000
  */
@@ -37,7 +43,7 @@ public class IterateOutwardsCache {
     /**
      * Immutable-after-publication map. Never mutated in place: writers copy, fill and then publish.
      */
-    private volatile Long2ObjectOpenHashMap<LongArrayList> table;
+    private volatile Long2ObjectOpenHashMap<LongList> table;
     private final int capacity;
 
     public IterateOutwardsCache(final int capacity) {
@@ -45,7 +51,7 @@ public class IterateOutwardsCache {
         this.table = new Long2ObjectOpenHashMap<>(31);
     }
 
-    private static LongArrayList fillPositionsWithIterateOutwards(final int xRange, final int yRange, final int zRange) {
+    private static LongList fillPositionsWithIterateOutwards(final int xRange, final int yRange, final int zRange) {
         // Add all positions to the cached list
         final LongArrayList entry = new LongArrayList(128);
         for (final BlockPos pos : BlockPos.withinManhattan(POS_ZERO, xRange, yRange, zRange)) {
@@ -53,30 +59,31 @@ public class IterateOutwardsCache {
         }
         //decrease the array size, as of now it won't be modified anymore anyways
         entry.trim();
-        return entry;
+        // Leaf - keep long lived, read only position tables outside the Java heap
+        return OffHeapLongLists.offHeapIfWorthwhile(entry);
     }
 
     public LongList getOrCompute(final int xRange, final int yRange, final int zRange) {
         final long key = BlockPos.asLong(xRange, yRange, zRange);
 
         // Fast path: plain array lookup on an immutable snapshot, no boxing, no locking.
-        final LongArrayList cached = this.table.get(key);
+        final LongList cached = this.table.get(key);
         if (cached != null) {
             return cached;
         }
 
-        final LongArrayList computed = fillPositionsWithIterateOutwards(xRange, yRange, zRange);
+        final LongList computed = fillPositionsWithIterateOutwards(xRange, yRange, zRange);
 
         synchronized (this) {
-            final Long2ObjectOpenHashMap<LongArrayList> current = this.table;
+            final Long2ObjectOpenHashMap<LongList> current = this.table;
             // Another thread may have computed the very same entry while we were building ours.
             // Both lists hold exactly the same positions, so reusing theirs is safe.
-            final LongArrayList existing = current.get(key);
+            final LongList existing = current.get(key);
             if (existing != null) {
                 return existing;
             }
 
-            final Long2ObjectOpenHashMap<LongArrayList> copy =
+            final Long2ObjectOpenHashMap<LongList> copy =
                 new Long2ObjectOpenHashMap<>(Math.max(16, current.size() + (current.size() >> 1) + 2));
             copy.putAll(current);
             copy.put(key, computed);
@@ -92,7 +99,14 @@ public class IterateOutwardsCache {
         }
     }
 
-    private void evictSome(final Long2ObjectOpenHashMap<LongArrayList> map, final long keepKey) {
+    /**
+     * @return number of cached radius triples, for {@code /leaf} style diagnostics
+     */
+    public int size() {
+        return this.table.size();
+    }
+
+    private void evictSome(final Long2ObjectOpenHashMap<LongList> map, final long keepKey) {
         // ThreadLocalRandom is cheaper than a shared Random instance and needs no synchronisation.
         // Quality does not matter here, we just want to thin out the cache.
         final ThreadLocalRandom random = ThreadLocalRandom.current();

@@ -18,6 +18,8 @@ public class LeafBootstrap {
         // Leaf start - boot time tuning (must run before Netty / sun.nio.ch are initialised)
         LeafRuntimeTuning.apply();
         JvmFlagAdvisor.printAdvice();
+        // Only does something when -Dleaf.offHeap.chunkCacheMB is set.
+        org.dreeam.leaf.perf.offheap.OffHeapChunkPayloadCache.installShutdownReport();
         // Leaf end - boot time tuning
 
         PaperBootstrap.boot(options);

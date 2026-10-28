@@ -77,8 +77,8 @@ public final class JvmFlagAdvisor {
             if (!hasSharedArchive) {
                 hints.add(
                     feature >= 24
-                        ? "-XX:AOTCache=leaf.aot            JDK 24+: AOT/CDS archive, faster and leaner startup"
-                        : "-XX:SharedArchiveFile=leaf.jsa   AppCDS archive, faster and leaner startup"
+                        ? "-XX:AOTCache=leaf.aot            JDK 24+: AOT/CDS archive, faster and leaner startup (see scripts/leaf-perf/leaf-cds.sh)"
+                        : "-XX:SharedArchiveFile=leaf-cds.jsa  AppCDS archive, faster and leaner startup (see scripts/leaf-perf/leaf-cds.sh)"
                 );
             }
 
@@ -95,7 +95,8 @@ public final class JvmFlagAdvisor {
             if (hints.size() > printed) {
                 message.append(PREFIX).append("  ... and ").append(hints.size() - printed).append(" more\n");
             }
-            message.append(PREFIX).append("Generated preset: scripts/leaf-perf/leaf-flags.sh (silence with -Dleaf.silentJvmAdvice=true)");
+            message.append(PREFIX).append("Generated preset: scripts/leaf-perf/leaf-flags.sh, archive: scripts/leaf-perf/leaf-cds.sh");
+            message.append('\n').append(PREFIX).append("Silence this report with -Dleaf.silentJvmAdvice=true");
             System.out.println(message);
         } catch (Throwable throwable) {
             System.err.println(PREFIX + "JVM flag advice skipped: " + throwable);

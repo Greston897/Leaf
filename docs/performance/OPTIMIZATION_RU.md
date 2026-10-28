@@ -66,6 +66,34 @@
 Это не «переписывание движка», это убирание мусора из путей, которые выполняются десятки тысяч раз
 в секунду: меньше аллокаций → короче young GC → меньше «дрожания» MSPT.
 
+### 1.3 Off-heap слой (новое)
+
+| Файл | Что | Почему не сломает плагины |
+| --- | --- | --- |
+| `perf/offheap/OffHeapLongArray` | `long[]` в native memory + read-only view | данные неизменяемые; наружу отдаётся обычный `LongList` |
+| `perf/offheap/OffHeapLongList` | read-only `LongList` (fastutil `AbstractLongList`) | интерфейс тот же, что у `LongArrayList` |
+| `perf/offheap/OffHeapLongLists` | решает, что выносить: только таблицы ≥ 1024 элементов, иначе heap (иначе будет медленнее) | выключено через `-Dleaf.offHeap=false` |
+| `perf/offheap/OffHeapChunkPayloadCache` | кэш сериализованных чанк-пейлоадов (native, бюджет `-Dleaf.offHeap.chunkCacheMB`) | `LevelChunk` не меняется; кэш выключен по умолчанию |
+| `perf/offheap/OffHeapByteArray` | immutable `byte[]` в native + `ByteBuffer` view | Netty пишет из direct-буфера без копии |
+
+Кэш пейлоадов полностью реализован, но **не включён по умолчанию**: ключ обязан содержать ревизию
+содержимого чанка, а её выставляет патч в `LevelChunk` (см. `PATCH_PROPOSALS_RU.md`, п.1). Включение:
+`-Dleaf.offHeap.chunkCacheMB=256`. По остановке сервера печатается отчёт (хиты/промахи/нативная
+память), чтобы было видно, окупается ли кэш.
+
+Флаги: `-Dleaf.offHeap=false` (выключить весь слой), `-Dleaf.offHeap.maxMB=64` (бюджет таблиц
+позиций), `-Dleaf.offHeap.minEntries=1024` (порог, ниже которого таблица остаётся на heap),
+`-Dleaf.asyncChunkSend.queueSize=16384` (предел очереди async chunk send).
+
+`IterateOutwardsCache` теперь складывает свои таблицы позиций (они immutable и живут весь аптайм)
+через `OffHeapLongLists.offHeapIfWorthwhile(...)` — большие таблицы уезжают из heap автоматически,
+маленькие остаются на heap (для них off-heap медленнее).
+
+`AsyncChunkSend.POOL` получил ограниченную очередь (`-Dleaf.asyncChunkSend.queueSize`, по умолчанию
+16 384 задачи) и `CallerRunsPolicy`: при всплеске захода пакеты не копятся в памяти, а
+обрабатываются на вызывающем потоке — ровно как при выключенной опции. Раньше очередь была
+неограниченной, и один заход с большим view-distance мог держать сотни мегабайт готовых пакетов.
+
 ---
 
 ## 2. Что добавлено для запуска и памяти
@@ -73,7 +101,10 @@
 Каталог `scripts/leaf-perf` (см. `README_RU.md` там же):
 
 * `leaf-flags.sh` — генерирует JVM-командную строку под конкретную машину (heap, G1/ZGC, метадата,
-  direct memory, Netty, AppCDS-совместимость). Флаги проверены на реальной Temurin 21: наборы
+  direct memory, Netty, AppCDS-совместимость), а также JIT-часть: `MaxVectorSize` по факту
+  AVX2/AVX-512 (auto-vectorisation без «downclock под AVX-512» на неподходящем CPU), `UseSuperWord`,
+  `UseCountedLoopSafepoints`, `LoopStripMiningIter`, `UseTransparentHugePages` — если ядро его
+  предлагает. Набор проверен на Temurin 21 для G1/ZGC/Parallel. Флаги проверены на реальной Temurin 21: наборы
   G1 / ZGC / Parallel принимаются без предупреждений; флаги JDK 22+/24+ добавляются только на
   соответствующей версии.
 * `leaf-cds.sh` — один раз поднимает сервер и записывает AppCDS-архив; дальше классы **ммap'ятся**
@@ -141,10 +172,24 @@
   (патч `0033`), где запись append-only и чтение маленькое. Реальный выигрыш от io_uring на
   прогретом кэше ОС — единицы процентов; на холодном диске узкое место — сам диск, а не syscall.
 
-**Что сделано вместо:** убраны аллокации в путях, которые кормят chunk-IO (см. §1.2), и добавлены
-настройки, которые реально уменьшают память вокруг чанков (`MaxDirectMemorySize`,
-`jdk.nio.maxCachedBufferSize`, лимит direct-арен Netty). Async построение/отправка чанков в Leaf уже
-есть (`async.async-chunk-send`), но по умолчанию **выключена**.
+**Что сделано вместо — off-heap там, где он совместим с плагинами.** В нативную память уехало то,
+что действительно большое, живёт долго и читается всеми потоками, но **не является объектом,
+который видят плагины**:
+
+* `perf/offheap/OffHeapLongArray` — `long[]` в direct-`ByteBuffer` (без `Unsafe`, без
+  `--enable-preview`, освобождение через `Cleaner`, бюджет `-Dleaf.offHeap.maxMB`),
+* `perf/offheap/OffHeapLongList` — read-only `LongList` поверх него (fastutil
+  `AbstractLongList`, реализованы только `size`/`getLong`), поэтому весь существующий код,
+  написанный под `LongList`, работает без изменений,
+* `perf/offheap/OffHeapChunkPayloadCache` + `OffHeapByteArray` — кэш сериализованных чанк-пейлоадов
+  в нативной памяти: Netty заворачивает direct-буфер **без копии**, GC этот пейлоад не сканирует,
+  а `LevelChunk`/`LevelChunkSection` остаются обычными Java-объектами → плагины, античит, WorldEdit,
+  Anti-Xray и NMS-код видят ровно то же, что и раньше.
+
+Дополнительно убраны аллокации в путях, которые кормят chunk-IO (§1.2), ограничен кэш direct-буферов
+и число Netty-арен. Async построение/отправка чанков в Leaf уже есть (`async.async-chunk-send`), по
+умолчанию **выключена**; у её очереди теперь есть предел, и при переполнении задача выполняется на
+вызывающем потоке (backpressure вместо роста RSS — см. §1.3).
 
 ### 4.2 Data-oriented design: `long[]` вместо объектов, `Long2ObjectOpenHashMap` + свой хэш
 
@@ -242,36 +287,66 @@ jdk.incubator.vector` при запуске и отсутствует в jlink'�
 
 ---
 
-## 7. Что делать дальше в самом движке (нужен рабочий билд)
+## 7. Патчи движка: что готово, а что ждёт сборки
 
-Это список конкретных мест, которые дают эффект и не ломают механики. Каждый пункт — отдельный
-патч в `leaf-server/minecraft-patches/features/`, и каждый требует прогонки сборки:
+Подробный план с точными якорями и кодом — `docs/performance/PATCH_PROPOSALS_RU.md`.
 
-1. **Кэш сериализованных чанк-пакетов** на группу игроков с одинаковым edge-light
-   (`ChunkMap`/`ServerGamePacketListenerImpl#sendChunk`): сжатие один раз на чанк, а не на игрока.
-2. **Переиспользование `BlockPos.MutableBlockPos` / `Vec3i` в горячих циклах** (`BlockPos.betweenClosed`,
-   `Level#getBlockState` в random tick, `Entity#checkInsideBlocks`) — убирает десятки тысяч аллокаций
-   в секунду, безопасно (только локальные курсоры).
-3. **`ServerChunkCache#tickChunks`**: разнести natural spawning и random tick по разным тикам
-   (round-robin), чтобы p99 не собирался в один тик (поведение идентично, только фазировка).
-4. **`ChunkMap#tick` / трекер**: убрать лишние `distanceToSqr` и повторные `chunkPosition()`
-   (часть уже сделана в `0168`), переиспользовать массивы вместо `ArrayList` на тик.
-5. **`LevelChunk#getBlockState` bound-check-free путь** для внутренних циклов 4096 секций
-   (без `Unsafe`, просто через локальные `LevelChunkSection[]` — JIT сам уберёт проверки).
-6. **Zero-alloc `WithinManhattan`-итераторы** (сейчас уже кэш, но `LongList2BlockPosMutableIterable`
-   всё ещё создаёт итератор + мутабельный `BlockPos` на вызов).
-7. **AppCDS-дружественный старт**: убрать `ServiceLoader`-сканы и повторные `getResource` в
-   `LibraryLoader`/`PluginScanner` — это одновременно метадата, время старта и первый тик после
-   захода.
+**Готово в этой итерации (обычный Java-код, без патчей Minecraft):**
 
-Пункты 1–7 проверяемы профилем; делать их «на глаз», без сборки и без spark — это гарантированные
-регрессии. Поэтому в этой итерации они описаны, но не закоммичены.
+1. Off-heap слой и кэш чанк-пейлоадов (`perf/offheap/*`) — включается флагом, не меняет
+   `LevelChunk`, поэтому плагины не затрагивает.
+2. `withinManhattan`-путь: таблицы позиций в native memory, итератор без `LongIterator` и с
+   индексом вместо объектов-итераторов.
+3. `FastBitRadixSort` (сортировка сущностей в сенсорах): буферы растут с запасом вместо точного
+   размера, один `List#get` + один `distanceToSqr` на элемент вместо двух, `Class#cast` убран,
+   ссылки на сущности не удерживаются между вызовами.
+4. Ограниченная очередь async chunk send (backpressure вместо роста памяти).
+
+**Ждёт сборки (описано в `PATCH_PROPOSALS_RU.md`, требует `applyAllPatches` + `build`):**
+
+| # | Патч | Ожидаемый эффект |
+| --- | --- | --- |
+| 1 | кэш чанк-пейлоадов + ревизия `LevelChunk` (хуки в `setBlockState`/`setBlockEntity`) | заход игрока: десятки мс → единицы |
+| 2 | переиспользование `MutableBlockPos` в `checkInsideBlocks`/`betweenClosed` | 3–8 % MSPT, минус десятки тысяч аллокаций/с |
+| 3 | round-robin random tick / natural spawning | p99 ниже на 10–30 %, среднее не меняется |
+| 4 | трекер без повторных `chunkPosition()`/`distanceToSqr` | 1–3 % |
+| 5 | `LevelChunk#getBlockState` через локальный `LevelChunkSection[]` | 1–3 % |
+| 6 | zero-alloc `withinManhattan` (fallback без кэша) | 1–2 % + меньше мусора |
+| 7 | ленивый library loader / без повторных сканов на старте | metaspace −100…400 МБ, старт быстрее |
+
+Каждый — отдельным файлом в `minecraft-patches/features/`, с прогоном сборки и профилем до/после.
 
 ---
 
-## 8. Быстрый чек-лист
+## 8. Тесты
+
+Новый код покрыт юнит-тестами в `leaf-server/src/test/java/org/dreeam/leaf/`:
+
+| Класс | Что проверяет |
+| --- | --- |
+| `perf/offheap/OffHeapTest` | round-trip native-памяти, бюджет, fallback на heap, независимость `ByteBuffer`-view, ключи кэша без коллизий, вытеснение по бюджету |
+| `util/cache/IterateOutwardsCacheTest` | содержимое таблиц, «маленькие — на heap, большие — off-heap», кэш-хит возвращает тот же экземпляр, итератор, ограниченность кэша, консистентность при 8 потоках |
+| `util/cache/CachedOrNewBitsGetterTest` | переиспользуемый `BitSet` всегда очищен, размеры независимы |
+| `util/list/ActivationListTest` | счётчик видимости против модели, 20 000 случайных переключений, компакция, удаление |
+| `util/list/BlockEntityTickersListTest` | fast path одиночного удаления = общий путь, границы (первый/последний/пусто), 1 000 случайных удалений против модели |
+
+Запуск:
 
 ```bash
+./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*'
+```
+
+В песочнице, где нет Gradle/paperweight, эти же тесты были скомпилированы компилятором Eclipse JDT
+(ECJ 3.39, `-source 21 -target 21`) и прогнаны на Temurin 21: **24 теста, 0 падений**. Отдельно
+проверены синтаксис и запуск `CpuFeatures`/`LeafRuntimeTuning`/`JvmFlagAdvisor` (советник печатает
+корректный список, тюнинг не перетирает явные `-D`).
+
+## 9. Быстрый чек-лист
+
+```bash
+# 0. тесты нового кода
+./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*'
+
 # 1. флаги под эту машину
 ./scripts/leaf-perf/leaf-flags.sh --heap 8G
 

@@ -3,6 +3,7 @@ package org.dreeam.leaf.util;
 import net.minecraft.world.entity.Entity;
 
 import java.lang.reflect.Array; // Required for Array.newInstance
+import java.util.Arrays;
 import java.util.List;
 
 public class FastBitRadixSort {
@@ -20,13 +21,19 @@ public class FastBitRadixSort {
         }
 
         if (this.entityBuffer.length < size) {
-            this.entityBuffer = new Entity[size];
-            this.bitsBuffer = new long[size];
+            // Leaf - grow with slack instead of allocating the exact size on every increase. The
+            // list length of a sensor changes all the time (one mob walks in, another dies), so exact
+            // sizing reallocated both buffers again and again.
+            final int newCapacity = Math.max(size, this.entityBuffer.length + (this.entityBuffer.length >> 1));
+            this.entityBuffer = new Entity[newCapacity];
+            this.bitsBuffer = new long[newCapacity];
         }
         for (int i = 0; i < size; i++) {
-            this.entityBuffer[i] = entities.get(i);
+            final Entity entity = entities.get(i);
+            this.entityBuffer[i] = entity;
+            // Leaf - one list read and one distance computation per element instead of two reads
             this.bitsBuffer[i] = Double.doubleToRawLongBits(
-                referenceEntity.distanceToSqr(entities.get(i))
+                referenceEntity.distanceToSqr(entity)
             );
         }
 
@@ -34,8 +41,14 @@ public class FastBitRadixSort {
 
         T[] resultArray = (T[]) Array.newInstance(entityClass, size);
         for (int i = 0; i < size; i++) {
-            resultArray[i] = entityClass.cast(this.entityBuffer[i]);
+            // Leaf - the buffer only ever holds elements taken from a List<T>, so an unchecked
+            // array store is enough; Class#cast added a per element type check here.
+            resultArray[i] = (T) this.entityBuffer[i];
         }
+        // Leaf - do not keep the sorted entities alive until the next call: a sensor that just looked
+        // at 40 mobs would otherwise pin all 40 objects (and their chunks' entities) for a whole tick
+        // after they died or unloaded.
+        Arrays.fill(this.entityBuffer, 0, size, null);
         return resultArray;
     }
 

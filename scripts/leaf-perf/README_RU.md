@@ -56,6 +56,22 @@ eval "$(./leaf-flags.sh --export)" && java $LEAF_JVM_FLAGS -jar leaf.jar --nogui
 `performance.*`/`async.*` переключатели Leaf (только читает `config/leaf-global.yml`), и готовые
 команды для spark / JFR.
 
+## Off-heap: что вынесено и какие флаги
+
+| Флаг | По умолчанию | Что делает |
+| --- | --- | --- |
+| `-Dleaf.offHeap=false` | `true` | полностью выключает off-heap слой (всё остаётся на heap) |
+| `-Dleaf.offHeap.maxMB=64` | `64` | бюджет нативных таблиц позиций (`withinManhattan`) |
+| `-Dleaf.offHeap.minEntries=1024` | `1024` | таблицы меньше этого остаются на heap (там они быстрее) |
+| `-Dleaf.offHeap.chunkCacheMB=0` | `0` (выкл) | бюджет кэша сериализованных чанк-пейлоадов; включать только после патча ревизии чанка |
+| `-Dleaf.offHeap.chunkCacheMaxEntryKB=512` | `512` | записи крупнее не кэшируются |
+| `-Dleaf.asyncChunkSend.queueSize=16384` | `16384` | предел очереди async chunk send (0 = без предела, старое поведение) |
+
+Всё вынесенное — immutable данные, которые GC раньше сканировал на каждом цикле: таблицы позиций
+`withinManhattan` (радиус 16 → ~48 КиБ, живут весь аптайм) и, если включить, сериализованные
+пейлоады чанков. `LevelChunk`/`LevelChunkSection` остаются обычными объектами, поэтому плагины,
+античиты и Anti-Xray работают как раньше.
+
 ## Память: откуда берутся «+2 ГБ»
 
 По порядку вероятности:

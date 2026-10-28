@@ -176,6 +176,37 @@ FLAGS+=(
     "-Dio.netty.leakDetection.level=disabled"
 )
 
+# --- JIT / hardware ------------------------------------------------------------
+# Auto-vectorisation (C2 SuperWord) is on by default, but the vector width is capped by
+# the JVM at what the CPU actually supports; setting it explicitly keeps the JIT from
+# generating AVX-512 code on a CPU that downclocks under it, and enables 256 bit
+# vectors on every AVX2 machine.
+CPU_FLAGS=""
+if [ -r /proc/cpuinfo ]; then
+    CPU_FLAGS="$(awk -F: '/^flags/ {print $2; exit}' /proc/cpuinfo)"
+fi
+case " $CPU_FLAGS " in
+    *" avx512f "*)
+        FLAGS+=("-XX:MaxVectorSize=64")
+        ;;
+    *" avx2 "*)
+        FLAGS+=("-XX:MaxVectorSize=32")
+        ;;
+esac
+FLAGS+=(
+    "-XX:+UseSuperWord"                 # vectorise counted loops (AABB, lighting maths)
+    "-XX:+UseCountedLoopSafepoints"     # safepoint polls at loop back-edges, not inside the body
+    "-XX:LoopStripMiningIter=1000"      # fewer, longer safepoint intervals in hot loops
+)
+# Transparent huge pages make the pre-touched heap one 2 MiB mapping per page: fewer TLB
+# misses in the tick loop. Only enabled when the kernel actually offers it.
+if [ -r /sys/kernel/mm/transparent_hugepage/enabled ]; then
+    THP="$(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+    case "$THP" in
+        *"[always]"*|*"[madvise]"*) FLAGS+=("-XX:+UseTransparentHugePages") ;;
+    esac
+fi
+
 # --- JDK version gated extras -------------------------------------------------
 if [ "$JDK_FEATURE" -ge 24 ]; then
     # JEP 450: 8 byte object headers - less heap, better cache locality.
