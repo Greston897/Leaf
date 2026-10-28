@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leaf <leaf@winds.studio>
+Date: Tue, 28 Oct 2026 12:00:00 +0100
+Subject: [PATCH] Optimise the chunk send batching (no streams, no boxing)
+
+
+diff --git a/net/minecraft/server/network/PlayerChunkSender.java b/net/minecraft/server/network/PlayerChunkSender.java
+--- a/net/minecraft/server/network/PlayerChunkSender.java
++++ b/net/minecraft/server/network/PlayerChunkSender.java
+@@ -131,33 +131,53 @@
+         DebugPackets.sendPoiPacketsForChunk(level, pos);
+     }
+ 
+-    private List<LevelChunk> collectChunksToSend(ChunkMap chunkMap, ChunkPos chunkPos) {
+-        int floor = Mth.floor(this.batchQuota);
+-        List<LevelChunk> list;
+-        if (!this.memoryConnection && this.pendingChunks.size() > floor) {
+-            list = this.pendingChunks
+-                .stream()
+-                .collect(Comparators.least(floor, Comparator.comparingInt(chunkPos::distanceSquared)))
+-                .stream()
+-                .mapToLong(Long::longValue)
+-                .mapToObj(chunkMap::getChunkToSend)
+-                .filter(Objects::nonNull)
+-                .toList();
+-        } else {
+-            list = this.pendingChunks
+-                .longStream()
+-                .mapToObj(chunkMap::getChunkToSend)
+-                .filter(Objects::nonNull)
+-                .sorted(Comparator.comparingInt(levelChunk1 -> chunkPos.distanceSquared(levelChunk1.getPos())))
+-                .toList();
+-        }
+-
+-        for (LevelChunk levelChunk : list) {
+-            this.pendingChunks.remove(levelChunk.getPos().toLong());
+-        }
+-
+-        return list;
+-    }
++    private List<LevelChunk> collectChunksToSend(ChunkMap chunkMap, ChunkPos chunkPos) {
++        // Leaf start - collect the chunks to send without streams and without boxing
++        // The vanilla version built two streams here, collected one of them through
++        // Comparators.least (which boxes every pending long in an intermediate list) and mapped a
++        // Long per element just to read a chunk position. This walks the long set once, keeps the
++        // distances in a scratch array and orders the chunks by (distance, iteration index) - the
++        // order the comparators produced - with a single long sort and no per-element objects.
++        final int floor = Mth.floor(this.batchQuota);
++        final int pending = this.pendingChunks.size();
++        if (pending == 0) {
++            return new java.util.ArrayList<>(0);
++        }
++
++        final long[] positions = new long[pending];
++        int count = 0;
++        final it.unimi.dsi.fastutil.longs.LongIterator iterator = this.pendingChunks.iterator();
++        while (count < pending && iterator.hasNext()) {
++            positions[count++] = iterator.nextLong();
++        }
++
++        // distance in the high half, iteration index in the low half: sorting the longs sorts the
++        // chunks nearest first and keeps the iteration order for equal distances
++        final long[] keys = new long[count];
++        for (int i = 0; i < count; i++) {
++            final long packed = positions[i];
++            final int dx = ChunkPos.getX(packed) - chunkPos.x;
++            final int dz = ChunkPos.getZ(packed) - chunkPos.z;
++            keys[i] = ((long) (dx * dx + dz * dz) << 32) | i;
++        }
++        java.util.Arrays.sort(keys);
++
++        final int limit = !this.memoryConnection && pending > floor ? Math.min(floor, count) : count;
++        final List<LevelChunk> list = new java.util.ArrayList<>(limit);
++        for (int i = 0; i < limit; i++) {
++            final LevelChunk levelChunk = chunkMap.getChunkToSend(positions[(int) keys[i]]);
++            if (levelChunk != null) {
++                list.add(levelChunk);
++            }
++        }
++
++        for (int i = 0, size = list.size(); i < size; i++) {
++            this.pendingChunks.remove(list.get(i).getPos().toLong());
++        }
++
++        return list;
++        // Leaf end - collect the chunks to send without streams and without boxing
++    }
+ 
+     public void onChunkBatchReceivedByClient(float desiredBatchSize) {
+         this.unacknowledgedBatches--;

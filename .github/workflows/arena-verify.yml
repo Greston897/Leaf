@@ -9,6 +9,9 @@ on:
     branches: [ "arena/6804670c-leaf" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 concurrency:
   group: verify-${{ github.ref }}
   cancel-in-progress: true
@@ -107,30 +110,34 @@ jobs:
           . /tmp/root.env
           scripts/ci/publish-excerpts.sh range CKPT "$ROOT/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java" 40 130
           scripts/ci/publish-excerpts.sh range CKWL "$ROOT/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java" 30 100
-          scripts/ci/publish-excerpts.sh range PCS  "$ROOT/net/minecraft/server/network/PlayerChunkSender.java" 60 135
+          scripts/ci/publish-excerpts.sh method PCS "$ROOT/net/minecraft/server/network/PlayerChunkSender.java" 'collectChunksToSend(ChunkMap' 60
+          scripts/ci/publish-excerpts.sh method CHUNKPOS-GETX "$ROOT/net/minecraft/world/level/ChunkPos.java" 'public static int getX(long' 25
 
-      - name: Excerpt - LevelChunk
+      - name: Excerpt - entity and chunk tick paths
         if: always()
         run: |
           set +e
           . /tmp/root.env
-          scripts/ci/publish-excerpts.sh method LC-SETBLOCK "$ROOT/net/minecraft/world/level/chunk/LevelChunk.java" 'BlockState setBlockState(BlockPos' 90
-          scripts/ci/publish-excerpts.sh method LC-GETBLOCK "$ROOT/net/minecraft/world/level/chunk/LevelChunk.java" 'BlockState getBlockState(BlockPos' 45
+          scripts/ci/publish-excerpts.sh method ENTITY-INSIDE "$ROOT/net/minecraft/world/entity/Entity.java" 'InsideBlock' 110
+          scripts/ci/publish-excerpts.sh method SCC-TICKCHUNKS "$ROOT/net/minecraft/server/level/ServerChunkCache.java" 'private void tickChunks(long' 200
+          scripts/ci/publish-excerpts.sh method SCC-COLLECT "$ROOT/net/minecraft/server/level/ServerChunkCache.java" 'collectTickingChunks(List' 45
 
-      - name: Excerpt - tick paths
+      - name: Excerpt - LevelChunk block access
         if: always()
         run: |
           set +e
           . /tmp/root.env
-          scripts/ci/publish-excerpts.sh method SCC-TICKCHUNKS "$ROOT/net/minecraft/server/level/ServerChunkCache.java" 'void tickChunks()' 130
-          scripts/ci/publish-excerpts.sh method ENTITY-INSIDE "$ROOT/net/minecraft/world/entity/Entity.java" 'checkInsideBlocks()' 70
+          scripts/ci/publish-excerpts.sh method LC-GETBLOCK "$ROOT/net/minecraft/world/level/chunk/LevelChunk.java" 'BlockState getBlockStateFinal' 45
+          scripts/ci/publish-excerpts.sh method LC-SECTIONINDEX "$ROOT/net/minecraft/world/level/chunk/LevelChunk.java" 'int getSectionIndex(int' 20
+          scripts/ci/publish-excerpts.sh method LCS-GETBLOCK "$ROOT/net/minecraft/world/level/chunk/LevelChunkSection.java" 'BlockState getBlockState(int' 35
 
-      - name: Excerpt - BlockPos walk
+      - name: Excerpt - BlockPos walks
         if: always()
         run: |
           set +e
           . /tmp/root.env
-          scripts/ci/publish-excerpts.sh method BP-WITHIN "$ROOT/net/minecraft/core/BlockPos.java" 'Iterable<BlockPos> withinManhattan' 70
+          scripts/ci/publish-excerpts.sh method BP-WITHIN "$ROOT/net/minecraft/core/BlockPos.java" 'Iterable<BlockPos> withinManhattan' 55
+          scripts/ci/publish-excerpts.sh method BP-BETWEEN "$ROOT/net/minecraft/core/BlockPos.java" 'Iterable<BlockPos> betweenClosed(AABB' 30
 
       - name: Report the test task configuration
         if: always()
@@ -246,10 +253,61 @@ jobs:
             leaf-server/build/test-results/**
           if-no-files-found: ignore
 
-      - name: Build the server jar
+      - name: Build the runnable jar
         run: |
           set -o pipefail
-          ./gradlew :leaf-server:jar --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-jar.log
+          ./gradlew createMojmapPaperclipJar --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-jar.log
+
+      - name: Upload the jar as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: leaf-1.21.4-arena-${{ github.run_number }}
+          path: |
+            leaf-1.21.4-arena-*.jar
+            leaf-1.21.4-arena-*.jar.sha256
+          if-no-files-found: error
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NAME="leaf-1.21.4-arena-${GITHUB_RUN_NUMBER}.jar"
+          JAR="$(find . -name '*paperclip*.jar' ! -name '*sources*' ! -name '*javadoc*' -print -quit)"
+          if [ -z "$JAR" ]; then
+            JAR="$(find . -path '*/build/libs/*.jar' ! -name '*sources*' ! -name '*javadoc*' -print -quit)"
+          fi
+          if [ -z "$JAR" ]; then
+            echo "no jar was produced"
+            exit 1
+          fi
+          echo "publishing $JAR as $NAME"
+          cp "$JAR" "$NAME"
+          sha256sum "$NAME" > "$NAME.sha256"
+          TAG="arena-1.21.4"
+          {
+            echo "Build of \`${GITHUB_SHA:0:7}\` on \`arena/6804670c-leaf\` (run #${GITHUB_RUN_NUMBER})."
+            echo
+            echo "Leaf 1.21.4 fork, arena branch. Verified in this run: \`applyAllPatches\`, unit tests and the jar build."
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Java | 21+ |"
+            echo "| Jar | \`$NAME\` |"
+            echo "| sha256 | \`$(cut -d' ' -f1 "$NAME.sha256")\` |"
+            echo
+            echo "Off-heap chunk payload cache stays disabled by default; enable it with \`-Dleaf.offHeap.chunkCacheMB=<MiB>\`."
+          } > /tmp/release-notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file /tmp/release-notes.md --target "$GITHUB_SHA"
+            gh release upload "$TAG" "$NAME" "$NAME.sha256" --clobber
+          else
+            gh release create "$TAG" "$NAME" "$NAME.sha256" \
+              --title "Leaf 1.21.4 — arena build" \
+              --notes-file /tmp/release-notes.md \
+              --target "$GITHUB_SHA"
+          fi
+          echo "release: $(gh release view "$TAG" --json url -q .url)"
 
       - name: Diagnose the test run
         if: always()
