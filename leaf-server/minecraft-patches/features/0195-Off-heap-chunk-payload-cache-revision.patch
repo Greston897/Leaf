@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leaf <leaf@winds.studio>
+Date: Tue, 28 Oct 2026 12:00:00 +0100
+Subject: [PATCH] Off-heap chunk payload cache: chunk revision counter
+
+
+diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/world/level/chunk/LevelChunk.java
+--- a/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -399,6 +399,19 @@
++    // Leaf start - off-heap chunk payload cache
++    private int leafPayloadRevision;
++
++    /**
++     * @return a counter that is bumped whenever the content a client can see changes; it keys the
++     * off-heap chunk payload cache
++     */
++    public int leafPayloadRevision() {
++        return this.leafPayloadRevision;
++    }
++    // Leaf end - off-heap chunk payload cache
++
+     @Nullable
+     public BlockState setBlockState(BlockPos pos, BlockState state, boolean isMoving, boolean doPlace) {
++        ++this.leafPayloadRevision; // Leaf - off-heap chunk payload cache
+         if (org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled) // Leaf - SparklyPaper - parallel world ticking mod (make configurable)
+             ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(this.level, pos, "Updating block asynchronously"); // SparklyPaper - parallel world ticking (additional concurrency issues logs)
+         // CraftBukkit end
+         int y = pos.getY();

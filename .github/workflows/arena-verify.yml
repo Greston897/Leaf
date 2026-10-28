@@ -53,62 +53,54 @@ jobs:
         env:
           GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g"
 
-      - name: Publish upstream excerpts as annotations
+      - name: Locate the generated sources
         if: always()
         run: |
           set +e
-          echo "== where do the generated sources live =="
-          find . -path '*/net/minecraft/core/BlockPos.java' 2>/dev/null | head -5
-          find . -path '*/net/minecraft/world/level/chunk/LevelChunk.java' 2>/dev/null | head -5
+          echo "== all BlockPos.java copies =="
+          find . -path '*/net/minecraft/core/BlockPos.java' 2>/dev/null | head -10
           ROOT=""
-          for candidate in $(find . -path '*/net/minecraft/core/BlockPos.java' 2>/dev/null | head -3); do
-            ROOT="${candidate%/net/minecraft/core/BlockPos.java}"
+          for candidate in $(find . -path '*/net/minecraft/core/BlockPos.java' 2>/dev/null); do
+            dir="${candidate%/net/minecraft/core/BlockPos.java}"
+            case "$dir" in
+              */leaf/*) ROOT="$dir" ;;
+              *) [ -z "$ROOT" ] && ROOT="$dir" ;;
+            esac
           done
-          echo "chosen root: $ROOT"
-          OUT=/tmp/excerpts.txt
-          : > "$OUT"
+          echo "ROOT=$ROOT"
+          echo "ROOT=$ROOT" > /tmp/root.env
 
-          {
-            echo "### ROOT: $ROOT"
-            echo
-            echo "### ClientboundLevelChunkPacketData.java"
-            sed -n '1,140p' "$ROOT/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java" 2>/dev/null
-            echo
-            echo "### ClientboundLevelChunkWithLightPacket.java"
-            sed -n '1,110p' "$ROOT/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java" 2>/dev/null
-            echo
-            echo "### PlayerChunkSender.java"
-            sed -n '55,145p' "$ROOT/net/minecraft/server/network/PlayerChunkSender.java" 2>/dev/null
-            echo
-            echo "### LevelChunk setBlockState"
-            awk '/BlockState setBlockState\(BlockPos/,/^    }/' "$ROOT/net/minecraft/world/level/chunk/LevelChunk.java" 2>/dev/null | head -90
-            echo
-            echo "### LevelChunk getBlockState"
-            awk '/BlockState getBlockState\(BlockPos/,/^    }/' "$ROOT/net/minecraft/world/level/chunk/LevelChunk.java" 2>/dev/null | head -40
-            echo
-            echo "### LevelChunk class declaration and first fields"
-            head -n 120 "$ROOT/net/minecraft/world/level/chunk/LevelChunk.java" 2>/dev/null
-            echo
-            echo "### ServerChunkCache tickChunks"
-            awk '/void tickChunks\(\)/,/^    }/' "$ROOT/net/minecraft/server/level/ServerChunkCache.java" 2>/dev/null | head -140
-            echo
-            echo "### Entity checkInsideBlocks"
-            awk '/checkInsideBlocks\(\)/,/^    }/' "$ROOT/net/minecraft/world/entity/Entity.java" 2>/dev/null | head -70
-            echo
-            echo "### BlockPos withinManhattan"
-            awk '/Iterable<BlockPos> withinManhattan/,/^    }/' "$ROOT/net/minecraft/core/BlockPos.java" 2>/dev/null | head -70
-          } >> "$OUT" 2>&1
+      - name: Excerpt - chunk packet pipeline
+        if: always()
+        run: |
+          set +e
+          . /tmp/root.env
+          scripts/ci/publish-excerpts.sh range CKPT "$ROOT/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java" 40 130
+          scripts/ci/publish-excerpts.sh range CKWL "$ROOT/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java" 30 100
+          scripts/ci/publish-excerpts.sh range PCS  "$ROOT/net/minecraft/server/network/PlayerChunkSender.java" 60 135
 
-          echo "excerpt size: $(wc -c < "$OUT") bytes"
-          python3 - "$OUT" <<'PYEOF'
-          import sys
-          data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-          limit = 55000
-          chunks = [data[i:i + limit] for i in range(0, len(data), limit)]
-          for index, chunk in enumerate(chunks[:8], start=1):
-              escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
-              print(f"::error title=UPSTREAM-EXCERPT-{index}-OF-{len(chunks)}::{escaped}")
-          PYEOF
+      - name: Excerpt - LevelChunk
+        if: always()
+        run: |
+          set +e
+          . /tmp/root.env
+          scripts/ci/publish-excerpts.sh method LC-SETBLOCK "$ROOT/net/minecraft/world/level/chunk/LevelChunk.java" 'BlockState setBlockState(BlockPos' 90
+          scripts/ci/publish-excerpts.sh method LC-GETBLOCK "$ROOT/net/minecraft/world/level/chunk/LevelChunk.java" 'BlockState getBlockState(BlockPos' 45
+
+      - name: Excerpt - tick paths
+        if: always()
+        run: |
+          set +e
+          . /tmp/root.env
+          scripts/ci/publish-excerpts.sh method SCC-TICKCHUNKS "$ROOT/net/minecraft/server/level/ServerChunkCache.java" 'void tickChunks()' 130
+          scripts/ci/publish-excerpts.sh method ENTITY-INSIDE "$ROOT/net/minecraft/world/entity/Entity.java" 'checkInsideBlocks()' 70
+
+      - name: Excerpt - BlockPos walk
+        if: always()
+        run: |
+          set +e
+          . /tmp/root.env
+          scripts/ci/publish-excerpts.sh method BP-WITHIN "$ROOT/net/minecraft/core/BlockPos.java" 'Iterable<BlockPos> withinManhattan' 70
 
       - name: Run Leaf unit tests
         run: |
