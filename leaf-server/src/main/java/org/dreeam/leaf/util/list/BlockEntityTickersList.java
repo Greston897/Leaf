@@ -71,6 +71,23 @@ public final class BlockEntityTickersList extends ObjectArrayList<TickingBlockEn
             return; // exit early, we don't need to do anything
 
         final Object[] a = this.a;
+
+        // Fast path: exactly one block entity was removed this tick, which is by far the most common
+        // case (a single container being broken / a hopper being replaced). One arraycopy instead of a
+        // full scan with a hash set lookup per element.
+        if (requiredMatches == 1) {
+            final int index = c.iterator().nextInt();
+            if (index >= startSearchFromIndex && index < size) {
+                final int newSize = size - 1;
+                if (index < newSize) {
+                    System.arraycopy(a, index + 1, a, index, newSize - index);
+                }
+                a[newSize] = null;
+                size = newSize;
+                return;
+            }
+        }
+
         int j = startSearchFromIndex;
         int matches = 0;
         for (int i = startSearchFromIndex; i < size; i++) { // If the user knows the first index to be removed, we can skip a lot of unnecessary comparsions

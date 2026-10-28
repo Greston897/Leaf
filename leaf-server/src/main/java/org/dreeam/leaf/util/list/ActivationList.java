@@ -26,6 +26,14 @@ public class ActivationList<E> extends AbstractList<E> {
     private final Object2IntOpenHashMap<E> elementToIndexMap;
     private final boolean isVisibleByDefault;
     private int removedSlotCount;
+    /**
+     * Number of set bits in {@link #visibilityMask}, maintained incrementally.
+     * <p>
+     * {@code BitSet#cardinality()} walks the whole word array, and {@code size()}/{@code isEmpty()}
+     * are called for every brain tick of every active mob. Keeping a counter turns both into a field
+     * read.
+     */
+    private int visibleCount;
 
     /**
      * Constructs a new, empty MaskedList.
@@ -60,7 +68,21 @@ public class ActivationList<E> extends AbstractList<E> {
             this.elements.add(element);
             this.elementToIndexMap.put(element, index);
         }
+        this.setVisibleAt(index, visible);
+    }
+
+    /**
+     * Sets a visibility bit and keeps {@link #visibleCount} in sync.
+     * {@code BitSet#get(int)} is a single array read, so this is cheaper than a full
+     * {@code cardinality()} recomputation and it is exact.
+     */
+    private void setVisibleAt(final int index, final boolean visible) {
+        final boolean previous = this.visibilityMask.get(index);
+        if (previous == visible) {
+            return;
+        }
         this.visibilityMask.set(index, visible);
+        this.visibleCount += visible ? 1 : -1;
     }
 
     /**
@@ -72,7 +94,7 @@ public class ActivationList<E> extends AbstractList<E> {
     public void setVisibility(E element, boolean visible) {
         int index = this.elementToIndexMap.getInt(element);
         if (index != -1) {
-            this.visibilityMask.set(index, visible);
+            this.setVisibleAt(index, visible);
         }
     }
 
@@ -92,6 +114,9 @@ public class ActivationList<E> extends AbstractList<E> {
             return false;
         }
 
+        if (this.visibilityMask.get(index)) {
+            this.visibleCount--;
+        }
         this.visibilityMask.clear(index);
         this.elements.set(index, null);
         this.removedSlotCount++;
@@ -126,12 +151,14 @@ public class ActivationList<E> extends AbstractList<E> {
             this.visibilityMask.clear(writeIndex, oldSize);
         }
 
+        // The mask was rewritten, so recompute the counter once instead of per moved slot.
+        this.visibleCount = this.visibilityMask.cardinality();
         this.removedSlotCount = 0;
     }
 
     @Override
     public int size() {
-        return this.visibilityMask.cardinality();
+        return this.visibleCount;
     }
 
     @Override
