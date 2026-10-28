@@ -20,16 +20,24 @@
 нельзя. В репозитории рядом есть `ver/26.3` — это **другая** версия Minecraft, с ней эта работа не
 связана.
 
-**Как проверить сборку** (в этой песочнице нет ни JDK, ни доступа к `repo.papermc.io` /
-`maven.leafmc.one`, поэтому компиляция здесь невозможна — проверялся только синтаксис и API):
+**Как проверяется сборка.** В песочнице нет ни JDK, ни доступа к `repo.papermc.io` /
+`maven.leafmc.one`, поэтому настоящая компиляция против NMS идёт в GitHub Actions:
+`.github/workflows/arena-verify.yml` на каждый пуш в эту ветку делает `applyAllPatches`, прогоняет
+юнит-тесты `org.dreeam.leaf.*`, собирает `:leaf-server:jar` и публикует результат.
 
-```bash
-./gradlew applyAllPatches --stacktrace   # патчи Minecraft не менялись -> должен пройти как раньше
-./gradlew build                          # компиляция leaf-server с новыми классами
-```
+Логи Actions из этой песочницы не скачиваются, поэтому воркфлоу печатает всё важное
+**аннотациями check-run** (их читает `gh api .../check-runs/<id>/annotations`):
 
-Ни один файл в `leaf-server/minecraft-patches`, `leaf-server/paper-patches` и `leaf-server/gale-patches`
-не тронут: если сборка упала — причина в компиляции Java-классов из §1, а не в патчах.
+* `HOOKS-*` — где именно в сгенерированном дереве лежат наши хуки (доказательство, что патч применился);
+* `CKPT`/`CKWL`/`PCS`/`LC-*`/`SCC-*`/`BP-*` — выдержки реального (уже пропатченного) кода,
+  по которым пишутся следующие патчи;
+* `GRADLE-*` — ошибки компиляции, если сборка упала.
+
+Сгенерированное дерево Leaf живой сборки — `leaf-server/src/minecraft/java` (именно в него
+применяются `leaf-server/minecraft-patches/features/*`); `_paper`/`_gale` копии в
+`.gradle/caches/paperweight/upstreams/` — это предыдущие ступени, наших хуков там нет.
+
+**Статус последнего прогона:** зелёный — `applyAllPatches` + тесты + сборка jar.
 
 ---
 
@@ -287,34 +295,65 @@ jdk.incubator.vector` при запуске и отсутствует в jlink'�
 
 ---
 
-## 7. Патчи движка: что готово, а что ждёт сборки
+## 7. Патчи движка: что уже собрано и проверено
 
-Подробный план с точными якорями и кодом — `docs/performance/PATCH_PROPOSALS_RU.md`.
+Подробный план с точными якорями — `docs/performance/PATCH_PROPOSALS_RU.md`.
 
-**Готово в этой итерации (обычный Java-код, без патчей Minecraft):**
+**Собрано и проверено зелёным прогоном CI (патчи применяются, компилируются, jar собирается):**
 
-1. Off-heap слой и кэш чанк-пейлоадов (`perf/offheap/*`) — включается флагом, не меняет
-   `LevelChunk`, поэтому плагины не затрагивает.
-2. `withinManhattan`-путь: таблицы позиций в native memory, итератор без `LongIterator` и с
-   индексом вместо объектов-итераторов.
-3. `FastBitRadixSort` (сортировка сущностей в сенсорах): буферы растут с запасом вместо точного
-   размера, один `List#get` + один `distanceToSqr` на элемент вместо двух, `Class#cast` убран,
-   ссылки на сущности не удерживаются между вызовами.
-4. Ограниченная очередь async chunk send (backpressure вместо роста памяти).
+| Файл | Что делает |
+| --- | --- |
+| `minecraft-patches/features/0195-Off-heap-chunk-payload-cache-revision.patch` | `LevelChunk` получает `int leafPayloadRevision`, инкремент в `setBlockState` и геттер `leafPayloadRevision()` |
+| `minecraft-patches/features/0196-Off-heap-chunk-payload-cache.patch` | `ClientboundLevelChunkPacketData`: если кэш включён, anti-xray не переписывает пакет и в чанке нет block entity — массив `buffer` берётся из off-heap кэша, иначе кодируется как раньше и кладётся в кэш |
+| `world/chunk/LeafChunkPayloads.java` | вся логика решения (`cachedOrNull` / `store` / `isCacheable` / ключ), чтобы патч NMS оставался двумя строчками |
 
-**Ждёт сборки (описано в `PATCH_PROPOSALS_RU.md`, требует `applyAllPatches` + `build`):**
+Патч NMS после применения выглядит так (реальный фрагмент из сгенерированного дерева):
+
+```java
+// Leaf start - off-heap chunk payload cache
+final byte[] leafCachedPayload =
+    org.dreeam.leaf.world.chunk.LeafChunkPayloads.cachedOrNull(levelChunk, chunkPacketInfo);
+if (leafCachedPayload != null) {
+    this.buffer = leafCachedPayload;          // попадание: одна копия из native-памяти
+} else {
+    this.buffer = new byte[calculateChunkSize(levelChunk)];
+    ...
+    extractChunkData(new FriendlyByteBuf(this.getWriteBuffer()), levelChunk, chunkPacketInfo);
+    org.dreeam.leaf.world.chunk.LeafChunkPayloads.store(levelChunk, chunkPacketInfo, this.buffer);
+}
+// Leaf end - off-heap chunk payload cache
+```
+
+**Что это даёт и когда включается.**
+
+* Экономия — на заходе игрока и на повторной отправке чанка: вместо `16 x write(section)` на каждый
+  чанк на каждого игрока (и `calculateChunkSize` перед этим) — одна копия `byte[]` из native-памяти.
+  На заходе с дистанцией 10 это 441 чанк, то есть 441 кодирование по ~16 секций.
+* Хуки **выключены по умолчанию**: кэш живёт только при `-Dleaf.offHeap.chunkCacheMB=<МБ>`
+  (по умолчанию `0`). Ни конфиг, ни поведение при этом не меняются: при `0` `isCacheable` возвращает
+  `false` на первом же сравнении, и код идёт ровно туда же, куда шёл до патча.
+* Ключ = измерение + `x` + `z` + ревизия чанка, смешанная с эпохой `gameTime / 12000`, поэтому
+  даже изменение, которое не проходит через `setBlockState` (например, плагинная правка биома), не
+  может остаться в кэше дольше 10 минут. Формально это единственное место, где кэш «стареет»; поэтому
+  он и не включён по умолчанию.
+* Anti-xray выключает кэш для конкретного пакета (`chunkPacketInfo != null`), потому что обфускация
+  считается на игрока. Чанки с block entity тоже не кэшируются (`getBlockEntities().isEmpty()`),
+  потому что их NBT меняется без блочных изменений (табличка, спавнер).
+
+**Ждёт своей очереди (описано в `PATCH_PROPOSALS_RU.md`):**
 
 | # | Патч | Ожидаемый эффект |
 | --- | --- | --- |
-| 1 | кэш чанк-пейлоадов + ревизия `LevelChunk` (хуки в `setBlockState`/`setBlockEntity`) | заход игрока: десятки мс → единицы |
+| 1 | отдача кэша в `PlayerChunkSender.collectChunksToSend` без stream-сортировки | −5…15 % на заходе, меньше мусора у GC |
 | 2 | переиспользование `MutableBlockPos` в `checkInsideBlocks`/`betweenClosed` | 3–8 % MSPT, минус десятки тысяч аллокаций/с |
 | 3 | round-robin random tick / natural spawning | p99 ниже на 10–30 %, среднее не меняется |
 | 4 | трекер без повторных `chunkPosition()`/`distanceToSqr` | 1–3 % |
 | 5 | `LevelChunk#getBlockState` через локальный `LevelChunkSection[]` | 1–3 % |
-| 6 | zero-alloc `withinManhattan` (fallback без кэша) | 1–2 % + меньше мусора |
+| 6 | zero-alloc `withinManhattan` | 1–2 % + меньше мусора |
 | 7 | ленивый library loader / без повторных сканов на старте | metaspace −100…400 МБ, старт быстрее |
 
-Каждый — отдельным файлом в `minecraft-patches/features/`, с прогоном сборки и профилем до/после.
+Правило прежнее: один патч — один файл, каждый проходит полный прогон CI (патчи + тесты + jar), и
+только после этого идёт следующий.
 
 ---
 
@@ -334,6 +373,16 @@ jdk.incubator.vector` при запуске и отсутствует в jlink'�
 
 ```bash
 ./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*'
+```
+
+Важно: в унаследованном `:leaf-server:test` включён фильтр `**/*TestSuite.class`, из-за которого
+обычные `*Test`-классы не запускаются («No tests found for given includes»). В CI фильтр
+переопределяется init-скриптом (`/tmp/leaf-tests.init.gradle` в воркфлоу), который ставит
+`filter.setIncludePatterns(['org.dreeam.leaf.*'])`. Локально можно так же:
+
+```bash
+./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*' \
+  --init-script <(printf 'allprojects { tasks.withType(Test).configureEach { filter.setIncludePatterns(["org.dreeam.leaf.*"] as String[]) } }')
 ```
 
 В песочнице, где нет Gradle/paperweight, эти же тесты были скомпилированы компилятором Eclipse JDT
