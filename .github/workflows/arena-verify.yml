@@ -157,24 +157,40 @@ jobs:
               print(f"::error title=TESTCFG-{index}-OF-{len(chunks)}::{escaped}")
           PYEOF
 
-      - name: Run Leaf unit tests
+      - name: Register a dedicated test task
         run: |
-          set -o pipefail
           cat > /tmp/leaf-tests.init.gradle <<'EOF'
-          // The upstream leaf-server build restricts the test task to classes matching
-          // **/*TestSuite.class, so plain *Test classes are silently skipped. Re-apply the filter
-          // after every project has been configured, otherwise the build script's own filter wins.
+          // ':leaf-server:test' carries an upstream include filter (**/*TestSuite.class) that silently
+          // skips ordinary *Test classes, and it is installed after an init script's own configuration
+          // runs, so overriding it in place is fragile. Register a separate test task instead: it uses
+          // the very same compiled test classes and runtime classpath, but no inherited filter.
           gradle.projectsEvaluated {
-              rootProject.allprojects { p ->
-                  p.tasks.withType(org.gradle.api.tasks.testing.Test).configureEach { t ->
-                      t.filter.setIncludePatterns(['org.dreeam.leaf.*'] as String[])
-                      t.filter.setFailOnNoMatchingTests(false)
-                      println "[Leaf CI] test filter of ${t.path}: ${t.filter.includePatterns}"
+              def project = rootProject.findProject(':leaf-server')
+              if (project == null) {
+                  throw new GradleException('leaf-server project not found')
+              }
+              project.tasks.register('leafUnitTest', org.gradle.api.tasks.testing.Test) { task ->
+                  task.description = 'Runs the Leaf unit tests (org.dreeam.leaf.*) without the upstream filter'
+                  task.group = 'verification'
+                  task.testClassesDirs = project.sourceSets.test.output.classesDirs
+                  task.classpath = project.sourceSets.test.runtimeClasspath
+                  task.useJUnitPlatform()
+                  task.filter {
+                      includeTestsMatching('org.dreeam.leaf.*')
+                      setFailOnNoMatchingTests(true)
+                  }
+                  task.testLogging {
+                      events 'passed', 'failed', 'skipped'
+                      exceptionFormat 'full'
                   }
               }
           }
           EOF
-          ./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*' --init-script /tmp/leaf-tests.init.gradle --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-test.log
+
+      - name: Run Leaf unit tests
+        run: |
+          set -o pipefail
+          ./gradlew :leaf-server:leafUnitTest --init-script /tmp/leaf-tests.init.gradle --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-test.log
 
       - name: Publish the test results as annotations
         if: always()
@@ -188,7 +204,7 @@ jobs:
 
           total = failures = errors = skipped = 0
           rows = []
-          for path in sorted(glob.glob("leaf-server/build/test-results/test/*.xml")):
+          for path in sorted(glob.glob("leaf-server/build/test-results/*/*.xml")):
               root = ET.parse(path).getroot()
               tests = int(root.get("tests", 0))
               failed = int(root.get("failures", 0))
@@ -234,6 +250,30 @@ jobs:
         run: |
           set -o pipefail
           ./gradlew :leaf-server:jar --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-jar.log
+
+      - name: Diagnose the test run
+        if: always()
+        run: |
+          set +e
+          OUT=/tmp/tesdiag.txt
+          {
+            echo "### compiled test classes"
+            find leaf-server/build/classes/java/test -name '*.class' 2>/dev/null | head -20
+            echo "### test results dir"
+            ls -la leaf-server/build/test-results/* 2>/dev/null | head -20
+            echo "### interesting log lines"
+            grep -nE "Leaf CI|No tests found|> Task :leaf-server:(test|leafUnitTest)|SKIPPED|BUILD " /tmp/gradle-test.log 2>/dev/null | head -30
+          } > "$OUT"
+          cat "$OUT"
+          python3 - "$OUT" <<'PYEOF'
+          import sys
+          data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          limit = 3500
+          chunks = [data[i:i + limit] for i in range(0, len(data), limit)] or [""]
+          for index, chunk in enumerate(chunks[:4], start=1):
+              escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+              print(f"::error title=TESTDIAG-{index}-OF-{len(chunks)}::{escaped}")
+          PYEOF
 
       - name: Publish failure details as annotations
         if: failure()
