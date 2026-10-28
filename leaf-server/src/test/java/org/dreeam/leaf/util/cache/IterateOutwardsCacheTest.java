@@ -23,10 +23,81 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class IterateOutwardsCacheTest {
 
+    /**
+     * Reference model: a line by line copy of {@code BlockPos#withinManhattan}'s iterator, written with
+     * plain ints.
+     * <p>
+     * The real {@code BlockPos.withinManhattan} is not usable as the reference here: the lithium patch
+     * (0098) makes {@code BlockPos} initialise this cache from its own static initialiser, and a
+     * reference walk that runs while {@code BlockPos} is still initialising produces positions with a
+     * garbage {@code z} offset. Keeping the model free of Minecraft types also means these tests run in
+     * a plain JVM, which is exactly the property the production code now has.
+     */
+    private static List<long[]> vanillaWalk(final int xSize, final int ySize, final int zSize) {
+        final List<long[]> out = new ArrayList<>();
+        final int maxDepth = xSize + ySize + zSize;
+        int currentDepth = 0;
+        int maxX = 0;
+        int x = 0;
+        int maxY = 0;
+        int y = 0;
+        boolean mirrorPending = false;
+        int mirrorX = 0;
+        int mirrorY = 0;
+        int mirrorZ = 0;
+
+        while (true) {
+            if (mirrorPending) {
+                // the vanilla iterator hands out the same cursor again, with only z mirrored
+                mirrorPending = false;
+                out.add(new long[]{mirrorX, mirrorY, mirrorZ});
+                continue;
+            }
+
+            boolean accepted = false;
+            while (!accepted) {
+                if (y > maxY) {
+                    x++;
+                    if (x > maxX) {
+                        currentDepth++;
+                        if (currentDepth > maxDepth) {
+                            return out;
+                        }
+                        maxX = Math.min(xSize, currentDepth);
+                        x = -maxX;
+                    }
+                    maxY = Math.min(ySize, currentDepth - Math.abs(x));
+                    y = -maxY;
+                }
+
+                final int z = currentDepth - Math.abs(x) - Math.abs(y);
+                if (z <= zSize) {
+                    out.add(new long[]{x, y, z});
+                    if (z != 0) {
+                        mirrorPending = true;
+                        mirrorX = x;
+                        mirrorY = y;
+                        mirrorZ = -z;
+                    }
+                    accepted = true;
+                }
+                y++;
+            }
+        }
+    }
+
     private static Set<Long> expected(final int x, final int y, final int z) {
         final Set<Long> out = new HashSet<>();
-        for (final BlockPos pos : BlockPos.withinManhattan(IterateOutwardsCache.POS_ZERO, x, y, z)) {
-            out.add(pos.asLong());
+        for (final long[] pos : vanillaWalk(x, y, z)) {
+            out.add(IterateOutwardsCache.asLong((int) pos[0], (int) pos[1], (int) pos[2]));
+        }
+        return out;
+    }
+
+    private static List<Long> modelOrder(final int x, final int y, final int z) {
+        final List<Long> out = new ArrayList<>();
+        for (final long[] pos : vanillaWalk(x, y, z)) {
+            out.add(IterateOutwardsCache.asLong((int) pos[0], (int) pos[1], (int) pos[2]));
         }
         return out;
     }
@@ -36,14 +107,6 @@ class IterateOutwardsCacheTest {
      * order in which that iterator hands out positions is observable behaviour (mob spawning picks the
      * first free position, random ticking walks the list front to back).
      */
-    private static List<Long> expectedOrder(final int x, final int y, final int z) {
-        final List<Long> out = new ArrayList<>();
-        for (final BlockPos pos : BlockPos.withinManhattan(IterateOutwardsCache.POS_ZERO, x, y, z)) {
-            out.add(pos.asLong());
-        }
-        return out;
-    }
-
     private static List<Long> cachedOrder(final LongList list) {
         final List<Long> out = new ArrayList<>(list.size());
         for (int i = 0; i < list.size(); i++) {
@@ -60,12 +123,34 @@ class IterateOutwardsCacheTest {
         return out;
     }
 
+    /**
+     * The cached tables are unpacked with {@code BlockPos.getX(long)}/{@code getY}/{@code getZ}, so the
+     * packing has to be bit for bit the one {@code BlockPos.asLong} uses. This test exists because a
+     * hand written version of that packing first shipped with y at bit 26 (the layout of older
+     * versions) instead of in the low 12 bits, and every cached position was off by a mile.
+     */
+    @Test
+    void packingMatchesBlockPos() {
+        for (int x = -60; x <= 60; x += 7) {
+            for (int y = -60; y <= 60; y += 13) {
+                for (int z = -60; z <= 60; z += 11) {
+                    final long expected = BlockPos.asLong(x, y, z);
+                    final long actual = IterateOutwardsCache.asLong(x, y, z);
+                    assertEquals(expected, actual, "packing differs for " + x + "/" + y + "/" + z);
+                    assertEquals(x, BlockPos.getX(actual), "unpacked x for " + x + "/" + y + "/" + z);
+                    assertEquals(y, BlockPos.getY(actual), "unpacked y for " + x + "/" + y + "/" + z);
+                    assertEquals(z, BlockPos.getZ(actual), "unpacked z for " + x + "/" + y + "/" + z);
+                }
+            }
+        }
+    }
+
     @Test
     void tableOrderMatchesTheVanillaIterator() {
         final IterateOutwardsCache cache = new IterateOutwardsCache(50);
 
         for (final int[] radius : new int[][]{{1, 1, 1}, {3, 3, 3}, {8, 4, 8}, {5, 2, 7}, {0, 0, 0}}) {
-            assertEquals(expectedOrder(radius[0], radius[1], radius[2]),
+            assertEquals(modelOrder(radius[0], radius[1], radius[2]),
                 cachedOrder(cache.getOrCompute(radius[0], radius[1], radius[2])),
                 "position order differs for " + radius[0] + "x" + radius[1] + "x" + radius[2]);
         }

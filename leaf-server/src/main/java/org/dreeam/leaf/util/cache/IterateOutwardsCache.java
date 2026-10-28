@@ -114,13 +114,17 @@ public class IterateOutwardsCache {
      * Byte for byte the same packing as {@code BlockPos.asLong}, inlined on purpose: calling that
      * method would trigger {@code BlockPos} class initialisation, which is exactly what must not
      * happen while {@code BlockPos} initialises this class (see above).
+     * <p>
+     * The layout is not the obvious one - {@code y} occupies the <b>low</b> 12 bits, {@code z} sits at
+     * bit 12 and {@code x} at bit 38, because the packer keeps the y coordinate in the small field so
+     * that the low half of the long can be read without shifts. The cached tables are unpacked with
+     * {@code BlockPos.getX(long)} / {@code getY(long)} / {@code getZ(long)}, so this must match
+     * exactly; {@code IterateOutwardsCacheTest.packingMatchesBlockPos} pins it down.
      */
     static long asLong(final int x, final int y, final int z) {
-        long packed = 0L;
-        packed |= ((long) x & 0x3FFFFFFL) << 38;
-        packed |= ((long) y & 0xFFFL) << 26;
-        packed |= (long) z & 0x3FFFFFFL;
-        return packed;
+        return ((long) x & 0x3FFFFFFL) << 38
+            | ((long) z & 0x3FFFFFFL) << 12
+            | ((long) y & 0xFFFL);
     }
 
     public LongList getOrCompute(final int xRange, final int yRange, final int zRange) {
