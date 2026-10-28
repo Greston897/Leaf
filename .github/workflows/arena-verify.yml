@@ -161,17 +161,15 @@ jobs:
         run: |
           set -o pipefail
           cat > /tmp/leaf-tests.init.gradle <<'EOF'
-          allprojects {
-              tasks.withType(Test).configureEach {
-                  try {
-                      filter.setIncludePatterns(['org.dreeam.leaf.*'] as String[])
-                      filter.setFailOnNoMatchingTests(false)
-                  } catch (Exception ignored) {
-                      println "[Leaf CI] could not adjust the test filter: " + ignored
-                  }
-                  testLogging {
-                      events 'passed', 'failed', 'skipped'
-                      exceptionFormat 'full'
+          // The upstream leaf-server build restricts the test task to classes matching
+          // **/*TestSuite.class, so plain *Test classes are silently skipped. Re-apply the filter
+          // after every project has been configured, otherwise the build script's own filter wins.
+          gradle.projectsEvaluated {
+              rootProject.allprojects { p ->
+                  p.tasks.withType(org.gradle.api.tasks.testing.Test).configureEach { t ->
+                      t.filter.setIncludePatterns(['org.dreeam.leaf.*'] as String[])
+                      t.filter.setFailOnNoMatchingTests(false)
+                      println "[Leaf CI] test filter of ${t.path}: ${t.filter.includePatterns}"
                   }
               }
           }
@@ -206,6 +204,8 @@ jobs:
           for row in rows:
               print(row)
           print(f"### total: {total} tests, {failures} failed, {errors} errors, {skipped} skipped")
+          if total == 0:
+              print("### ERROR: no test results were produced - the org.dreeam.leaf tests did not run")
           PYEOF
           cat "$OUT"
           python3 - "$OUT" <<'PYEOF'
@@ -217,6 +217,8 @@ jobs:
               escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
               print(f"::error title=TESTRESULTS-{index}-OF-{len(chunks)}::{escaped}")
           PYEOF
+          grep -q "### ERROR: no test results" "$OUT" && { echo "no unit test ran"; exit 1; }
+          exit 0
 
       - name: Upload test report
         if: failure()
