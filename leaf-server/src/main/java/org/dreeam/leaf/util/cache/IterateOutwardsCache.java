@@ -51,20 +51,80 @@ public class IterateOutwardsCache {
         this.table = new Long2ObjectOpenHashMap<>(31);
     }
 
+    /**
+     * Fills the position table with exactly the sequence {@code BlockPos.withinManhattan(POS_ZERO, ...)}
+     * would produce, but without creating a single {@link BlockPos}.
+     * <p>
+     * <b>Why the code is duplicated here.</b> {@code 0098-Lithium-cached-iterate-outwards.patch} makes
+     * {@code BlockPos} fill its own {@code HOGLIN_PIGLIN_CACHE} from this class inside the
+     * {@code BlockPos} static initialiser. Calling back into {@code BlockPos} from here - which is what
+     * the previous implementation did through {@code BlockPos.withinManhattan} - re-enters a class that
+     * is still initialising, reads {@link #POS_ZERO} before it has been assigned and dies with a
+     * {@code NullPointerException}. It only "worked" on a server because {@code BlockPos} happens to be
+     * loaded first; loading this class first (a unit test, a plugin touching the cache, a future patch
+     * with a different load order) crashed it. Pure integer arithmetic cannot re-enter anything, so the
+     * order of class loading stops mattering, and the fill loop also stops allocating a
+     * {@code MutableBlockPos} plus one object per position.
+     *
+     * @see #asLong(int, int, int) for the packing, which mirrors {@code BlockPos.asLong}
+     */
     private static LongList fillPositionsWithIterateOutwards(final int xRange, final int yRange, final int zRange) {
-        // Add all positions to the cached list
         final LongArrayList entry = new LongArrayList(128);
-        for (final BlockPos pos : BlockPos.withinManhattan(POS_ZERO, xRange, yRange, zRange)) {
-            entry.add(pos.asLong());
+        final int maxDepth = xRange + yRange + zRange;
+        int currentDepth = 0;
+        int maxX = 0;
+        int x = 0;
+        int maxY = 0;
+        int y = 0;
+
+        // Same state machine as BlockPos#withinManhattan: a shell per Manhattan depth, x sweeping
+        // from -maxX to maxX, y from -maxY to maxY, and the +z position mirrored into -z.
+        while (true) {
+            if (y > maxY) {
+                x++;
+                if (x > maxX) {
+                    currentDepth++;
+                    if (currentDepth > maxDepth) {
+                        break;
+                    }
+                    maxX = Math.min(xRange, currentDepth);
+                    x = -maxX;
+                }
+                maxY = Math.min(yRange, currentDepth - Math.abs(x));
+                y = -maxY;
+            }
+
+            final int z = currentDepth - Math.abs(x) - Math.abs(y);
+            if (z <= zRange) {
+                entry.add(asLong(x, y, z));
+                if (z != 0) {
+                    entry.add(asLong(x, y, -z));
+                }
+            }
+            y++;
         }
+
         //decrease the array size, as of now it won't be modified anymore anyways
         entry.trim();
         // Leaf - keep long lived, read only position tables outside the Java heap
         return OffHeapLongLists.offHeapIfWorthwhile(entry);
     }
 
+    /**
+     * Byte for byte the same packing as {@code BlockPos.asLong}, inlined on purpose: calling that
+     * method would trigger {@code BlockPos} class initialisation, which is exactly what must not
+     * happen while {@code BlockPos} initialises this class (see above).
+     */
+    static long asLong(final int x, final int y, final int z) {
+        long packed = 0L;
+        packed |= ((long) x & 0x3FFFFFFL) << 38;
+        packed |= ((long) y & 0xFFFL) << 26;
+        packed |= (long) z & 0x3FFFFFFL;
+        return packed;
+    }
+
     public LongList getOrCompute(final int xRange, final int yRange, final int zRange) {
-        final long key = BlockPos.asLong(xRange, yRange, zRange);
+        final long key = asLong(xRange, yRange, zRange);
 
         // Fast path: plain array lookup on an immutable snapshot, no boxing, no locking.
         final LongList cached = this.table.get(key);

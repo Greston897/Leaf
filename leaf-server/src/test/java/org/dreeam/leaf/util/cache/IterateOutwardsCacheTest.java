@@ -31,6 +31,27 @@ class IterateOutwardsCacheTest {
         return out;
     }
 
+    /**
+     * The exact order, not just the content: the cache feeds {@code BlockPos.withinManhattan}, and the
+     * order in which that iterator hands out positions is observable behaviour (mob spawning picks the
+     * first free position, random ticking walks the list front to back).
+     */
+    private static List<Long> expectedOrder(final int x, final int y, final int z) {
+        final List<Long> out = new ArrayList<>();
+        for (final BlockPos pos : BlockPos.withinManhattan(IterateOutwardsCache.POS_ZERO, x, y, z)) {
+            out.add(pos.asLong());
+        }
+        return out;
+    }
+
+    private static List<Long> cachedOrder(final LongList list) {
+        final List<Long> out = new ArrayList<>(list.size());
+        for (int i = 0; i < list.size(); i++) {
+            out.add(list.getLong(i));
+        }
+        return out;
+    }
+
     private static Set<Long> content(final LongList list) {
         final Set<Long> out = new HashSet<>();
         for (int i = 0; i < list.size(); i++) {
@@ -40,12 +61,23 @@ class IterateOutwardsCacheTest {
     }
 
     @Test
+    void tableOrderMatchesTheVanillaIterator() {
+        final IterateOutwardsCache cache = new IterateOutwardsCache(50);
+
+        for (final int[] radius : new int[][]{{1, 1, 1}, {3, 3, 3}, {8, 4, 8}, {5, 2, 7}, {0, 0, 0}}) {
+            assertEquals(expectedOrder(radius[0], radius[1], radius[2]),
+                cachedOrder(cache.getOrCompute(radius[0], radius[1], radius[2])),
+                "position order differs for " + radius[0] + "x" + radius[1] + "x" + radius[2]);
+        }
+    }
+
+    @Test
     void smallTableStaysOnTheHeap() {
         final IterateOutwardsCache cache = new IterateOutwardsCache(50);
         final LongList small = cache.getOrCompute(3, 3, 3);
 
         assertEquals(expected(3, 3, 3), content(small));
-        assertFalse(small instanceof OffHeapLongList, "a 63 element table is not worth moving off heap");
+        assertFalse(small instanceof OffHeapLongList, "a 343 element table is not worth moving off heap");
         assertSame(small, cache.getOrCompute(3, 3, 3), "cache hit must return the very same instance");
     }
 
