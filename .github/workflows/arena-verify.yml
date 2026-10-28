@@ -48,7 +48,8 @@ jobs:
 
       - name: Apply patches
         run: |
-          ./gradlew applyAllPatches --stacktrace --no-daemon
+          set -o pipefail
+          ./gradlew applyAllPatches --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-patch.log
         env:
           GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g"
 
@@ -108,7 +109,8 @@ jobs:
 
       - name: Run Leaf unit tests
         run: |
-          ./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*' --stacktrace --no-daemon
+          set -o pipefail
+          ./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*' --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-test.log
 
       - name: Upload test report
         if: failure()
@@ -122,4 +124,32 @@ jobs:
 
       - name: Build the server jar
         run: |
-          ./gradlew :leaf-server:jar --stacktrace --no-daemon
+          set -o pipefail
+          ./gradlew :leaf-server:jar --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-jar.log
+
+      - name: Publish failure details as annotations
+        if: failure()
+        run: |
+          set +e
+          OUT=/tmp/failure.txt
+          : > "$OUT"
+          for f in /tmp/gradle-patch.log /tmp/gradle-test.log /tmp/gradle-jar.log; do
+            [ -f "$f" ] || continue
+            {
+              echo "### $f : error lines"
+              grep -nE "error:|FAILED|Compilation failed|Execution failed|Caused by|what went wrong" "$f" | head -80
+              echo "### $f : tail"
+              tail -n 60 "$f"
+              echo
+            } >> "$OUT"
+          done
+          echo "failure excerpt size: $(wc -c < "$OUT") bytes"
+          python3 - "$OUT" <<'PYEOF'
+          import sys
+          data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          limit = 55000
+          chunks = [data[i:i + limit] for i in range(0, len(data), limit)]
+          for index, chunk in enumerate(chunks[:8], start=1):
+              escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+              print(f"::error title=CI-FAILURE-{index}-OF-{len(chunks)}::{escaped}")
+          PYEOF
