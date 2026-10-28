@@ -87,11 +87,11 @@ jobs:
           REPORT=/tmp/hooks.txt
           : > "$REPORT"
           for marker in leafPayloadRevision 'LeafChunkPayloads' \
-                        'Leaf - collect the chunks to send' \
-                        'Leaf - no intermediate BlockPos per call' \
-                        'Leaf - hoist the loop invariants' \
-                        'Leaf - tick by index instead of allocating an iterator' \
-                        'Leaf - one array read per lookup'; do
+                        'collect the chunks to send without streams' \
+                        'no intermediate BlockPos per call' \
+                        'hoist the loop invariants' \
+                        'tick by index instead of allocating an iterator' \
+                        'one array read per lookup'; do
             echo "### marker: $marker"
             grep -rn --include=*.java "$marker" leaf-server .gradle/caches/paperweight/upstreams 2>/dev/null | grep -v '^leaf-server/src/main' | head -5
             echo
