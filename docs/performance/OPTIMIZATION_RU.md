@@ -364,37 +364,51 @@ if (leafCachedPayload != null) {
 | Класс | Что проверяет |
 | --- | --- |
 | `perf/offheap/OffHeapTest` | round-trip native-памяти, бюджет, fallback на heap, независимость `ByteBuffer`-view, ключи кэша без коллизий, вытеснение по бюджету |
-| `util/cache/IterateOutwardsCacheTest` | содержимое таблиц, «маленькие — на heap, большие — off-heap», кэш-хит возвращает тот же экземпляр, итератор, ограниченность кэша, консистентность при 8 потоках |
+| `util/cache/IterateOutwardsCacheTest` | содержимое и **точный порядок** таблиц против модели ванильного итератора, упаковка `x/y/z` бит в бит как `BlockPos.asLong` (плюс распаковка через `BlockPos.getX/getY/getZ`), «маленькие — на heap, большие — off-heap», кэш-хит возвращает тот же экземпляр, ограниченность кэша, консистентность при 8 потоках |
 | `util/cache/CachedOrNewBitsGetterTest` | переиспользуемый `BitSet` всегда очищен, размеры независимы |
 | `util/list/ActivationListTest` | счётчик видимости против модели, 20 000 случайных переключений, компакция, удаление |
 | `util/list/BlockEntityTickersListTest` | fast path одиночного удаления = общий путь, границы (первый/последний/пусто), 1 000 случайных удалений против модели |
 
-Запуск:
+Запуск в CI (и локально так же):
 
 ```bash
-./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*'
+./gradlew :leaf-server:leafUnitTest --init-script /tmp/leaf-tests.init.gradle
 ```
 
-Важно: в унаследованном `:leaf-server:test` включён фильтр `**/*TestSuite.class`, из-за которого
-обычные `*Test`-классы не запускаются («No tests found for given includes»). В CI фильтр
-переопределяется init-скриптом (`/tmp/leaf-tests.init.gradle` в воркфлоу), который ставит
-`filter.setIncludePatterns(['org.dreeam.leaf.*'])`. Локально можно так же:
+`:leaf-server:test` использовать нельзя: в унаследованном билд-скрипте стоит фильтр
+`**/*TestSuite.class` (тесты Paper собраны в `@Suite`-классы), из-за которого обычные `*Test`-классы
+молча не запускаются — задача завершается успешно, не выполнив ни одного теста. Воркфлоу поэтому
+регистрирует отдельную задачу `leafUnitTest` на тех же скомпилированных классах и на том же
+classpath, с `failOnNoMatchingTests = true`, и дополнительно валит job, если JUnit-XML пустой.
 
-```bash
-./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*' \
-  --init-script <(printf 'allprojects { tasks.withType(Test).configureEach { filter.setIncludePatterns(["org.dreeam.leaf.*"] as String[]) } }')
-```
+**Результат последнего прогона: 26 тестов, 0 падений** (OffHeap 9, IterateOutwardsCache 7,
+CachedOrNewBitsGetter 2, ActivationList 5, BlockEntityTickersList 3), плюс зелёные
+`applyAllPatches` и `:leaf-server:jar`.
 
-В песочнице, где нет Gradle/paperweight, эти же тесты были скомпилированы компилятором Eclipse JDT
-(ECJ 3.39, `-source 21 -target 21`) и прогнаны на Temurin 21: **24 теста, 0 падений**. Отдельно
-проверены синтаксис и запуск `CpuFeatures`/`LeafRuntimeTuning`/`JvmFlagAdvisor` (советник печатает
-корректный список, тюнинг не перетирает явные `-D`).
+### Что тесты уже поймали
+
+Это не абстрактные проверки — два реальных дефекта были найдены именно на CI:
+
+1. **Цикл инициализации классов** (`IterateOutwardsCache` ↔ `BlockPos`). Патч `0098` заполняет
+   `BlockPos.HOGLIN_PIGLIN_CACHE` из `IterateOutwardsCache` прямо в статическом инициализаторе
+   `BlockPos`, а тот вызывал `BlockPos.withinManhattan(...)`, который читал
+   `IterateOutwardsCache.POS_ZERO` до присваивания — `NullPointerException`. На сервере это не
+   проявлялось только потому, что `BlockPos` всегда загружается первым. Теперь таблицы позиций
+   строятся чистой целочисленной арифметикой, порядок загрузки классов больше не важен, и на
+   построение таблицы не тратится ни одного объекта.
+2. **Неверная упаковка координат.** Ручная копия `BlockPos.asLong` сначала получилась со старым
+   layout'ом (`y << 26`). В 1.21 `x` живёт в бите 38, `z` — в бите 12, а `y` — в младших 12 битах;
+   при ошибке каждая позиция в таблицах указывала бы не туда, и mob spawning / random tick ходили бы
+   по чужим координатам. Тест `packingMatchesBlockPos` сверяет упаковку с `BlockPos.asLong` и
+   распаковку через `BlockPos.getX/getY/getZ`.
+
+---
 
 ## 9. Быстрый чек-лист
 
 ```bash
 # 0. тесты нового кода
-./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*'
+./gradlew :leaf-server:leafUnitTest --init-script /tmp/leaf-tests.init.gradle
 
 # 1. флаги под эту машину
 ./scripts/leaf-perf/leaf-flags.sh --heap 8G
