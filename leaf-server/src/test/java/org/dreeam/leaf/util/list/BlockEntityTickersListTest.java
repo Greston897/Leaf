@@ -18,9 +18,25 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  */
 class BlockEntityTickersListTest {
 
-    private record Ticker(int id) implements TickingBlockEntity {
+    /**
+     * {@link TickingBlockEntity} is not a functional interface in this version: besides
+     * {@code tick()} it declares {@code getType()}, and the block entity ticker list only ever
+     * reads the identity of the element, so a minimal implementation is enough.
+     */
+    private static final class Ticker implements TickingBlockEntity {
+        private final int id;
+
+        private Ticker(final int id) {
+            this.id = id;
+        }
+
         @Override
         public void tick() {
+        }
+
+        @Override
+        public String getType() {
+            return "leaf:test_ticker";
         }
     }
 

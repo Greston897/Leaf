@@ -57,9 +57,12 @@ jobs:
         if: always()
         run: |
           set +e
+          echo "== where do the generated sources live =="
+          find . -path '*/net/minecraft/core/BlockPos.java' 2>/dev/null | head -5
+          find . -path '*/net/minecraft/world/level/chunk/LevelChunk.java' 2>/dev/null | head -5
           ROOT=""
-          for candidate in paper-server/src/minecraft/java paper-server/src/main/java; do
-            if [ -f "$candidate/net/minecraft/core/BlockPos.java" ]; then ROOT="$candidate"; fi
+          for candidate in $(find . -path '*/net/minecraft/core/BlockPos.java' 2>/dev/null | head -3); do
+            ROOT="${candidate%/net/minecraft/core/BlockPos.java}"
           done
           echo "chosen root: $ROOT"
           OUT=/tmp/excerpts.txt
