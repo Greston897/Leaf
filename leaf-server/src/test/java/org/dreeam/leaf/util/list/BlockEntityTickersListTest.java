@@ -1,5 +1,6 @@
 package org.dreeam.leaf.util.list;
 
+import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
 import org.junit.jupiter.api.Test;
 
@@ -19,8 +20,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 class BlockEntityTickersListTest {
 
     /**
-     * {@link TickingBlockEntity} is not a functional interface in this version: besides
-     * {@code tick()} it declares {@code getType()}, and the block entity ticker list only ever
+     * {@link TickingBlockEntity} is not a functional interface in this version (it also declares
+     * {@code getType()}, {@code getPos()} and {@code isRemoved()}), and the ticker list only ever
      * reads the identity of the element, so a minimal implementation is enough.
      */
     private static final class Ticker implements TickingBlockEntity {
@@ -38,12 +39,22 @@ class BlockEntityTickersListTest {
         public String getType() {
             return "leaf:test_ticker";
         }
+
+        @Override
+        public BlockPos getPos() {
+            return BlockPos.ZERO;
+        }
+
+        @Override
+        public boolean isRemoved() {
+            return false;
+        }
     }
 
     private static List<Integer> ids(final BlockEntityTickersList list) {
         final List<Integer> out = new ArrayList<>();
         for (int i = 0; i < list.size(); i++) {
-            out.add(((Ticker) list.get(i)).id());
+            out.add(((Ticker) list.get(i)).id);
         }
         return out;
     }

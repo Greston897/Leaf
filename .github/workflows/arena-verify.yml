@@ -57,18 +57,44 @@ jobs:
         if: always()
         run: |
           set +e
-          echo "== all BlockPos.java copies =="
-          find . -path '*/net/minecraft/core/BlockPos.java' 2>/dev/null | head -10
-          ROOT=""
-          for candidate in $(find . -path '*/net/minecraft/core/BlockPos.java' 2>/dev/null); do
-            dir="${candidate%/net/minecraft/core/BlockPos.java}"
-            case "$dir" in
-              */leaf/*) ROOT="$dir" ;;
-              *) [ -z "$ROOT" ] && ROOT="$dir" ;;
-            esac
-          done
+          echo "== trees =="
+          find .gradle/caches/paperweight/upstreams -maxdepth 3 -name file -type d 2>/dev/null
+          # The patches land in the tree of the registered upstream ("gale"); find it by our own
+          # marker instead of guessing, so that the excerpts below always show post-patch code.
+          PATCHED="$(grep -rl --include=LevelChunk.java 'leafPayloadRevision' .gradle/caches/paperweight/upstreams 2>/dev/null | head -1)"
+          if [ -n "$PATCHED" ]; then
+            ROOT="${PATCHED%/net/minecraft/world/level/chunk/LevelChunk.java}"
+          else
+            ROOT="$(find .gradle/caches/paperweight/upstreams -path '*/gale/file/src/minecraft/java' -type d 2>/dev/null | head -1)"
+          fi
+          echo "PATCHED=$PATCHED"
           echo "ROOT=$ROOT"
           echo "ROOT=$ROOT" > /tmp/root.env
+          echo "PATCHED=$PATCHED" >> /tmp/root.env
+
+      - name: Verify the leaf hooks are in the generated tree
+        if: always()
+        run: |
+          set +e
+          . /tmp/root.env
+          REPORT=/tmp/hooks.txt
+          : > "$REPORT"
+          for marker in leafPayloadRevision 'off-heap chunk payload cache' 'LeafChunkPayloads'; do
+            echo "### marker: $marker"
+            grep -rn --include=*.java "$marker" .gradle/caches/paperweight/upstreams 2>/dev/null | head -5
+            echo
+          done >> "$REPORT"
+          echo "### hook report"
+          cat "$REPORT"
+          python3 - "$REPORT" <<'PYEOF'
+          import sys
+          data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          limit = 3500
+          chunks = [data[i:i + limit] for i in range(0, len(data), limit)] or [""]
+          for index, chunk in enumerate(chunks[:4], start=1):
+              escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+              print(f"::error title=HOOKS-{index}-OF-{len(chunks)}::{escaped}")
+          PYEOF
 
       - name: Excerpt - chunk packet pipeline
         if: always()
@@ -126,25 +152,31 @@ jobs:
         if: failure()
         run: |
           set +e
-          OUT=/tmp/failure.txt
-          : > "$OUT"
           for f in /tmp/gradle-patch.log /tmp/gradle-test.log /tmp/gradle-jar.log; do
             [ -f "$f" ] || continue
+            OUT="/tmp/failure-$(basename "$f").txt"
             {
-              echo "### $f : error lines"
-              grep -nE "error:|FAILED|Compilation failed|Execution failed|Caused by|what went wrong" "$f" | head -80
+              echo "### $f : error context"
+              grep -nE "error:|FAILED|Compilation failed|Execution failed|what went wrong" "$f" | head -40 | cut -d: -f1 | while read -r line; do
+                start=$(( line > 3 ? line - 3 : 1 ))
+                end=$(( line + 6 ))
+                sed -n "${start},${end}p" "$f"
+                echo "---"
+              done
               echo "### $f : tail"
-              tail -n 60 "$f"
-              echo
-            } >> "$OUT"
-          done
-          echo "failure excerpt size: $(wc -c < "$OUT") bytes"
-          python3 - "$OUT" <<'PYEOF'
+              tail -n 40 "$f"
+            } > "$OUT"
+            echo "failure excerpt $(basename "$OUT"): $(wc -c < "$OUT") bytes"
+            NAME="$(basename "$f" .log | tr 'a-z-' 'A-Z-')"
+            NAME="$NAME" python3 - "$OUT" <<'PYEOF'
+          import os
           import sys
           data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-          limit = 55000
-          chunks = [data[i:i + limit] for i in range(0, len(data), limit)]
-          for index, chunk in enumerate(chunks[:8], start=1):
+          limit = 3500
+          chunks = [data[i:i + limit] for i in range(0, len(data), limit)] or [""]
+          name = os.environ.get("NAME", "CI-FAILURE")
+          for index, chunk in enumerate(chunks[:6], start=1):
               escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
-              print(f"::error title=CI-FAILURE-{index}-OF-{len(chunks)}::{escaped}")
+              print(f"::error title={name}-{index}-OF-{len(chunks)}::{escaped}")
           PYEOF
+          done
