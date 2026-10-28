@@ -37,7 +37,7 @@
 применяются `leaf-server/minecraft-patches/features/*`); `_paper`/`_gale` копии в
 `.gradle/caches/paperweight/upstreams/` — это предыдущие ступени, наших хуков там нет.
 
-**Статус последнего прогона:** зелёный — `applyAllPatches` + тесты + сборка jar.
+**Статус последнего прогона:** зелёный — `applyAllPatches` + 26 тестов + сборка jar + релиз.
 
 ---
 
@@ -299,61 +299,52 @@ jdk.incubator.vector` при запуске и отсутствует в jlink'�
 
 Подробный план с точными якорями — `docs/performance/PATCH_PROPOSALS_RU.md`.
 
-**Собрано и проверено зелёным прогоном CI (патчи применяются, компилируются, jar собирается):**
+**Сделано и проверено зелёным прогоном CI (патчи применяются, код компилируется, тесты идут, jar
+собирается и публикуется):**
 
-| Файл | Что делает |
-| --- | --- |
-| `minecraft-patches/features/0195-Off-heap-chunk-payload-cache-revision.patch` | `LevelChunk` получает `int leafPayloadRevision`, инкремент в `setBlockState` и геттер `leafPayloadRevision()` |
-| `minecraft-patches/features/0196-Off-heap-chunk-payload-cache.patch` | `ClientboundLevelChunkPacketData`: если кэш включён, anti-xray не переписывает пакет и в чанке нет block entity — массив `buffer` берётся из off-heap кэша, иначе кодируется как раньше и кладётся в кэш |
-| `world/chunk/LeafChunkPayloads.java` | вся логика решения (`cachedOrNull` / `store` / `isCacheable` / ключ), чтобы патч NMS оставался двумя строчками |
+| # | Файл | Что делает | Что даёт |
+| --- | --- | --- | --- |
+| 1 | `0195-Off-heap-chunk-payload-cache-revision.patch` | `LevelChunk`: `int leafPayloadRevision`, инкремент в `setBlockState`, геттер | ключ кэша, который меняется на каждое изменение блока |
+| 2 | `0196-Off-heap-chunk-payload-cache.patch` | `ClientboundLevelChunkPacketData`: `buffer` из off-heap кэша вместо повторного кодирования секций | заход игрока: одно копирование `byte[]` вместо `16 × write(section)` на чанк |
+| 3 | `0197-Optimise-the-chunk-send-batching.patch` | `PlayerChunkSender.collectChunksToSend` без двух stream-конвейеров и без боксинга `Long` | заход игрока, меньше мусора у GC, тот же порядок «ближние первыми» |
+| 4 | `0198-BlockPos-betweenClosed-without-temporary-positions.patch` | `BlockPos.betweenClosed(AABB)` и `(BlockPos, BlockPos)` без промежуточных объектов | −2 аллокации и −6 виртуальных вызовов на каждый обход AABB |
+| 5 | `0199-ServerChunkCache-cheaper-spawning-and-random-tick-loops.patch` | `ServerChunkCache.tickChunks`: инварианты цикла спавна вынесены, оба горячих цикла идут по индексу | заметно на сервере с игроками: `isEmpty()`/`getWorldBorder()` больше не вызываются на каждый чанк |
+| 6 | `0200-LevelChunk-getBlockStateFinal-single-section-read.patch` | `getBlockStateFinal` читает `sections[i]` один раз в локальную переменную | самый горячий метод чтения блока в игре, −1 чтение массива на вызов |
 
-Патч NMS после применения выглядит так (реальный фрагмент из сгенерированного дерева):
+Плюс `world/chunk/LeafChunkPayloads.java` — вся логика решения кэша (`cachedOrNull` / `store` /
+`isCacheable` / ключ), чтобы патчи NMS оставались двумя строчками.
 
-```java
-// Leaf start - off-heap chunk payload cache
-final byte[] leafCachedPayload =
-    org.dreeam.leaf.world.chunk.LeafChunkPayloads.cachedOrNull(levelChunk, chunkPacketInfo);
-if (leafCachedPayload != null) {
-    this.buffer = leafCachedPayload;          // попадание: одна копия из native-памяти
-} else {
-    this.buffer = new byte[calculateChunkSize(levelChunk)];
-    ...
-    extractChunkData(new FriendlyByteBuf(this.getWriteBuffer()), levelChunk, chunkPacketInfo);
-    org.dreeam.leaf.world.chunk.LeafChunkPayloads.store(levelChunk, chunkPacketInfo, this.buffer);
-}
-// Leaf end - off-heap chunk payload cache
-```
+Всё это — **чистый перф**: ни один патч не меняет observable-поведение. Порядок обхода в 0197 —
+тот же, что давали компараторы (`(расстояние, индекс итерации)`); в 0198 и 0199 — порядок ванильного
+итератора; в 0200 сохранён прежний порядок короткого замыкания (сначала «индекс вне массива → воздух»,
+потом «пустая секция → воздух»).
 
-**Что это даёт и когда включается.**
+Патч `0098` (lithium redirect) вместе с `IterateOutwardsCache` теперь строит таблицы позиций **без
+обращения к `BlockPos`** — это чинит цикл инициализации классов, найденный тестами (см. §8).
 
-* Экономия — на заходе игрока и на повторной отправке чанка: вместо `16 x write(section)` на каждый
-  чанк на каждого игрока (и `calculateChunkSize` перед этим) — одна копия `byte[]` из native-памяти.
-  На заходе с дистанцией 10 это 441 чанк, то есть 441 кодирование по ~16 секций.
-* Хуки **выключены по умолчанию**: кэш живёт только при `-Dleaf.offHeap.chunkCacheMB=<МБ>`
-  (по умолчанию `0`). Ни конфиг, ни поведение при этом не меняются: при `0` `isCacheable` возвращает
-  `false` на первом же сравнении, и код идёт ровно туда же, куда шёл до патча.
-* Ключ = измерение + `x` + `z` + ревизия чанка, смешанная с эпохой `gameTime / 12000`, поэтому
-  даже изменение, которое не проходит через `setBlockState` (например, плагинная правка биома), не
-  может остаться в кэше дольше 10 минут. Формально это единственное место, где кэш «стареет»; поэтому
-  он и не включён по умолчанию.
-* Anti-xray выключает кэш для конкретного пакета (`chunkPacketInfo != null`), потому что обфускация
-  считается на игрока. Чанки с block entity тоже не кэшируются (`getBlockEntities().isEmpty()`),
-  потому что их NBT меняется без блочных изменений (табличка, спавнер).
-
-**Ждёт своей очереди (описано в `PATCH_PROPOSALS_RU.md`):**
+**Следующий шаг (не в этом прогоне):**
 
 | # | Патч | Ожидаемый эффект |
 | --- | --- | --- |
-| 1 | отдача кэша в `PlayerChunkSender.collectChunksToSend` без stream-сортировки | −5…15 % на заходе, меньше мусора у GC |
-| 2 | переиспользование `MutableBlockPos` в `checkInsideBlocks`/`betweenClosed` | 3–8 % MSPT, минус десятки тысяч аллокаций/с |
-| 3 | round-robin random tick / natural spawning | p99 ниже на 10–30 %, среднее не меняется |
-| 4 | трекер без повторных `chunkPosition()`/`distanceToSqr` | 1–3 % |
-| 5 | `LevelChunk#getBlockState` через локальный `LevelChunkSection[]` | 1–3 % |
-| 6 | zero-alloc `withinManhattan` | 1–2 % + меньше мусора |
-| 7 | ленивый library loader / без повторных сканов на старте | metaspace −100…400 МБ, старт быстрее |
+| 1 | передвижение мобов: переиспользуемые позиции в `getOnPos`/`vibrationAndSoundEffectsFromBlock` | 1–3 % MSPT, минус аллокации в `Entity` |
+| 2 | `NaturalSpawner.spawnForChunk`: локальные переменные вместо повторных `getLevel()`/`getChunkSource()` | 1–3 % на сервере с игроками |
+| 3 | ленивый library loader / без повторных сканов на старте | metaspace −100…400 МБ, старт быстрее |
 
-Правило прежнее: один патч — один файл, каждый проходит полный прогон CI (патчи + тесты + jar), и
-только после этого идёт следующий.
+---
+
+## 7.1 Релиз
+
+Каждый зелёный прогон выкладывает готовый серверный jar:
+
+* GitHub Release: **`arena-1.21.4`** —
+  `https://github.com/Greston897/Leaf/releases/tag/arena-1.21.4`
+  (тег перезаписывается на каждый зелёный пуш; старые ассеты остаются, текущий — по имени
+  `leaf-1.21.4-arena-<номер прогона>.jar` + `.sha256`);
+* артефакт прогона: `leaf-1.21.4-arena-<номер прогона>` в разделе Artifacts.
+
+Собирается `createMojmapPaperclipJar`, то есть обычный запускаемый `java -jar leaf-...jar`.
+Кэш чанк-пейлоадов по-прежнему **выключен по умолчанию** (`-Dleaf.offHeap.chunkCacheMB=<МиБ>`),
+конфиг не тронут.
 
 ---
 
