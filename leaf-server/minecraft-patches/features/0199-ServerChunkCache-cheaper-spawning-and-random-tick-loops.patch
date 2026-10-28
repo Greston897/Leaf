@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leaf <leaf@winds.studio>
+Date: Tue, 28 Oct 2026 12:00:00 +0100
+Subject: [PATCH] Cheaper natural spawning and random tick loops
+
+
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -700,9 +700,17 @@
+             long time = level.getGameTime();
+-            for (LevelChunk levelChunk : chunks) {
+-                ChunkPos pos = levelChunk.getPos();
+-                levelChunk.incrementInhabitedTime(sumTimeInhabited);
+-                if (!filteredSpawningCategories.isEmpty() && this.level.getWorldBorder().isWithinBounds(pos) && this.chunkMap.anyPlayerCloseEnoughForSpawning(pos, true)) { // Spigot
+-                    NaturalSpawner.spawnForChunk(this.level, levelChunk, lastSpawnState1, filteredSpawningCategories, time); // Pufferfish
+-                }
+-            }
++            // Leaf start - hoist the loop invariants and iterate by index
++            // isEmpty() was re-evaluated for every chunk of the level even though the category list
++            // cannot change inside this loop, and getWorldBorder() resolved the same field per chunk.
++            final net.minecraft.world.level.border.WorldBorder leafBorder = this.level.getWorldBorder();
++            final boolean leafSpawning = !filteredSpawningCategories.isEmpty();
++            final ServerLevel leafLevel = this.level;
++            for (int leafIndex = 0, leafSize = chunks.size(); leafIndex < leafSize; leafIndex++) {
++                final LevelChunk levelChunk = chunks.get(leafIndex);
++                ChunkPos pos = levelChunk.getPos();
++                levelChunk.incrementInhabitedTime(sumTimeInhabited);
++                if (leafSpawning && leafBorder.isWithinBounds(pos) && this.chunkMap.anyPlayerCloseEnoughForSpawning(pos, true)) { // Spigot
++                    NaturalSpawner.spawnForChunk(leafLevel, levelChunk, lastSpawnState1, filteredSpawningCategories, time); // Pufferfish
++                }
++            }
++            // Leaf end - hoist the loop invariants and iterate by index
+             if (delaySpawn != -1L) {
+@@ -760,10 +760,11 @@
+         // Leaf end - optimize mob spawning
+ 
+-        for (LevelChunk levelChunk : chunks) { // Leaf - optimize mob spawning - split to 2 loop
+-            if (true) { // Paper - rewrite chunk system
+-                this.level.tickChunk(levelChunk, _int);
+-            }
+-        }
++        // Leaf start - tick by index instead of allocating an iterator every tick
++        final ServerLevel leafTickLevel = this.level;
++        for (int leafIndex = 0, leafSize = chunks.size(); leafIndex < leafSize; leafIndex++) {
++            leafTickLevel.tickChunk(chunks.get(leafIndex), _int); // Paper - rewrite chunk system
++        }
++        // Leaf end - tick by index instead of allocating an iterator every tick
+         this.level.randomTickSystem.tick(this.level); // Leaf - optimize random tick
+ 
+         if (flagAndHasNaturalSpawn) { // Gale - MultiPaper - skip unnecessary mob spawning computations

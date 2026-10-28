@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leaf <leaf@winds.studio>
+Date: Tue, 28 Oct 2026 12:00:00 +0100
+Subject: [PATCH] BlockPos.betweenClosed without temporary positions
+
+
+diff --git a/net/minecraft/core/BlockPos.java b/net/minecraft/core/BlockPos.java
+--- a/net/minecraft/core/BlockPos.java
++++ b/net/minecraft/core/BlockPos.java
+@@ -427,24 +427,36 @@
+     public static Stream<BlockPos> withinManhattanStream(BlockPos pos, int xSize, int ySize, int zSize) {
+         return StreamSupport.stream(withinManhattan(pos, xSize, ySize, zSize).spliterator(), false);
+     }
+ 
+-    public static Iterable<BlockPos> betweenClosed(AABB box) {
+-        BlockPos blockPos = containing(box.minX, box.minY, box.minZ);
+-        BlockPos blockPos1 = containing(box.maxX, box.maxY, box.maxZ);
+-        return betweenClosed(blockPos, blockPos1);
+-    }
+-
+-    public static Iterable<BlockPos> betweenClosed(BlockPos firstPos, BlockPos secondPos) {
+-        return betweenClosed(
+-            Math.min(firstPos.getX(), secondPos.getX()),
+-            Math.min(firstPos.getY(), secondPos.getY()),
+-            Math.min(firstPos.getZ(), secondPos.getZ()),
+-            Math.max(firstPos.getX(), secondPos.getX()),
+-            Math.max(firstPos.getY(), secondPos.getY()),
+-            Math.max(firstPos.getZ(), secondPos.getZ())
+-        );
+-    }
++    public static Iterable<BlockPos> betweenClosed(AABB box) {
++        // Leaf start - no intermediate BlockPos per call
++        // Vanilla built two BlockPos through containing(...) only to unpack all six coordinates again
++        // in the int overload below, so every AABB walk allocated two objects and made six virtual
++        // getter calls that were immediately thrown away.
++        final int x1 = Mth.floor(box.minX);
++        final int y1 = Mth.floor(box.minY);
++        final int z1 = Mth.floor(box.minZ);
++        final int x2 = Mth.floor(box.maxX);
++        final int y2 = Mth.floor(box.maxY);
++        final int z2 = Mth.floor(box.maxZ);
++        return betweenClosed(Math.min(x1, x2), Math.min(y1, y2), Math.min(z1, z2),
++                             Math.max(x1, x2), Math.max(y1, y2), Math.max(z1, z2));
++        // Leaf end - no intermediate BlockPos per call
++    }
++
++    public static Iterable<BlockPos> betweenClosed(BlockPos firstPos, BlockPos secondPos) {
++        // Leaf start - read every coordinate once
++        final int x1 = firstPos.getX();
++        final int y1 = firstPos.getY();
++        final int z1 = firstPos.getZ();
++        final int x2 = secondPos.getX();
++        final int y2 = secondPos.getY();
++        final int z2 = secondPos.getZ();
++        return betweenClosed(Math.min(x1, x2), Math.min(y1, y2), Math.min(z1, z2),
++                             Math.max(x1, x2), Math.max(y1, y2), Math.max(z1, z2));
++        // Leaf end - read every coordinate once
++    }
+ 
+     public static Stream<BlockPos> betweenClosedStream(BlockPos firstPos, BlockPos secondPos) {
+         return StreamSupport.stream(betweenClosed(firstPos, secondPos).spliterator(), false);
+     }

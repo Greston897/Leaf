@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leaf <leaf@winds.studio>
+Date: Tue, 28 Oct 2026 12:00:00 +0100
+Subject: [PATCH] LevelChunk.getBlockStateFinal: one array read per lookup
+
+
+diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/world/level/chunk/LevelChunk.java
+--- a/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -351,15 +351,20 @@
+     public BlockState getBlockState(final int x, final int y, final int z) {
+         return this.getBlockStateFinal(x, y, z);
+     }
+-    public BlockState getBlockStateFinal(final int x, final int y, final int z) {
+-        // Copied and modified from below
+-        final int sectionIndex = this.getSectionIndex(y);
+-        if (sectionIndex < 0 || sectionIndex >= this.sections.length
+-            || this.sections[sectionIndex].nonEmptyBlockCount == 0) {
+-            return Blocks.AIR.defaultBlockState();
+-        }
+-        return this.sections[sectionIndex].states.get((y & 15) << 8 | (z & 15) << 4 | x & 15);
+-    }
++    public BlockState getBlockStateFinal(final int x, final int y, final int z) {
++        // Copied and modified from below
++        // Leaf start - one array read per lookup, same short circuit order
++        final int sectionIndex = this.getSectionIndex(y);
++        if (sectionIndex < 0 || sectionIndex >= this.sections.length) {
++            return Blocks.AIR.defaultBlockState();
++        }
++        final LevelChunkSection section = this.sections[sectionIndex];
++        if (section.nonEmptyBlockCount == 0) {
++            return Blocks.AIR.defaultBlockState();
++        }
++        return section.states.get((y & 15) << 8 | (z & 15) << 4 | x & 15);
++        // Leaf end - one array read per lookup, same short circuit order
++    }
+     @Override
+     public BlockState getBlockState(BlockPos pos) {
+         if (true) {

@@ -258,6 +258,24 @@ jobs:
           set -o pipefail
           ./gradlew createMojmapPaperclipJar --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-jar.log
 
+      - name: Collect the jar
+        run: |
+          set -euo pipefail
+          NAME="leaf-1.21.4-arena-${GITHUB_RUN_NUMBER}.jar"
+          JAR="$(find . -name '*paperclip*.jar' ! -name '*sources*' ! -name '*javadoc*' -print -quit)"
+          if [ -z "$JAR" ]; then
+            JAR="$(find . -path '*/build/libs/*.jar' ! -name '*sources*' ! -name '*javadoc*' -print -quit)"
+          fi
+          if [ -z "$JAR" ]; then
+            echo "no jar was produced"
+            exit 1
+          fi
+          echo "using $JAR"
+          cp "$JAR" "$NAME"
+          sha256sum "$NAME" > "$NAME.sha256"
+          ls -la "$NAME" "$NAME.sha256"
+          cat "$NAME.sha256"
+
       - name: Upload the jar as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -273,22 +291,11 @@ jobs:
         run: |
           set -euo pipefail
           NAME="leaf-1.21.4-arena-${GITHUB_RUN_NUMBER}.jar"
-          JAR="$(find . -name '*paperclip*.jar' ! -name '*sources*' ! -name '*javadoc*' -print -quit)"
-          if [ -z "$JAR" ]; then
-            JAR="$(find . -path '*/build/libs/*.jar' ! -name '*sources*' ! -name '*javadoc*' -print -quit)"
-          fi
-          if [ -z "$JAR" ]; then
-            echo "no jar was produced"
-            exit 1
-          fi
-          echo "publishing $JAR as $NAME"
-          cp "$JAR" "$NAME"
-          sha256sum "$NAME" > "$NAME.sha256"
           TAG="arena-1.21.4"
           {
             echo "Build of \`${GITHUB_SHA:0:7}\` on \`arena/6804670c-leaf\` (run #${GITHUB_RUN_NUMBER})."
             echo
-            echo "Leaf 1.21.4 fork, arena branch. Verified in this run: \`applyAllPatches\`, unit tests and the jar build."
+            echo "Leaf 1.21.4, arena branch. This run verified \`applyAllPatches\`, the Leaf unit tests and the jar build."
             echo
             echo "| | |"
             echo "| --- | --- |"
@@ -296,18 +303,18 @@ jobs:
             echo "| Jar | \`$NAME\` |"
             echo "| sha256 | \`$(cut -d' ' -f1 "$NAME.sha256")\` |"
             echo
-            echo "Off-heap chunk payload cache stays disabled by default; enable it with \`-Dleaf.offHeap.chunkCacheMB=<MiB>\`."
+            echo "The off-heap chunk payload cache is off by default; enable it with \`-Dleaf.offHeap.chunkCacheMB=<MiB>\`."
           } > /tmp/release-notes.md
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --notes-file /tmp/release-notes.md --target "$GITHUB_SHA"
             gh release upload "$TAG" "$NAME" "$NAME.sha256" --clobber
           else
             gh release create "$TAG" "$NAME" "$NAME.sha256" \
-              --title "Leaf 1.21.4 — arena build" \
+              --title "Leaf 1.21.4 - arena build" \
               --notes-file /tmp/release-notes.md \
               --target "$GITHUB_SHA"
           fi
-          echo "release: $(gh release view "$TAG" --json url -q .url)"
+          echo "release url: $(gh release view "$TAG" --json url -q .url)"
 
       - name: Diagnose the test run
         if: always()
