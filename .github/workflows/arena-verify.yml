@@ -178,6 +178,46 @@ jobs:
           EOF
           ./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*' --init-script /tmp/leaf-tests.init.gradle --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-test.log
 
+      - name: Publish the test results as annotations
+        if: always()
+        run: |
+          set +e
+          OUT=/tmp/testreport.txt
+          : > "$OUT"
+          python3 - >> "$OUT" <<'PYEOF'
+          import glob
+          import xml.etree.ElementTree as ET
+
+          total = failures = errors = skipped = 0
+          rows = []
+          for path in sorted(glob.glob("leaf-server/build/test-results/test/*.xml")):
+              root = ET.parse(path).getroot()
+              tests = int(root.get("tests", 0))
+              failed = int(root.get("failures", 0))
+              broken = int(root.get("errors", 0))
+              skipped_here = int(root.get("skipped", 0))
+              total += tests
+              failures += failed
+              errors += broken
+              skipped += skipped_here
+              rows.append(f"{root.get('name')}: {tests} tests, {failed} failed, {broken} errors, {skipped_here} skipped")
+
+          print("### leaf unit tests")
+          for row in rows:
+              print(row)
+          print(f"### total: {total} tests, {failures} failed, {errors} errors, {skipped} skipped")
+          PYEOF
+          cat "$OUT"
+          python3 - "$OUT" <<'PYEOF'
+          import sys
+          data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          limit = 3500
+          chunks = [data[i:i + limit] for i in range(0, len(data), limit)] or [""]
+          for index, chunk in enumerate(chunks[:4], start=1):
+              escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+              print(f"::error title=TESTRESULTS-{index}-OF-{len(chunks)}::{escaped}")
+          PYEOF
+
       - name: Upload test report
         if: failure()
         uses: actions/upload-artifact@v4
