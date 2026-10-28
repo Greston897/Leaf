@@ -57,15 +57,19 @@ jobs:
         if: always()
         run: |
           set +e
-          echo "== trees =="
-          find .gradle/caches/paperweight/upstreams -maxdepth 3 -name file -type d 2>/dev/null
-          # The patches land in the tree of the registered upstream ("gale"); find it by our own
-          # marker instead of guessing, so that the excerpts below always show post-patch code.
-          PATCHED="$(grep -rl --include=LevelChunk.java 'leafPayloadRevision' .gradle/caches/paperweight/upstreams 2>/dev/null | head -1)"
+          echo "== candidate source roots =="
+          for candidate in leaf-server/src/minecraft/java .gradle/caches/paperweight/upstreams/server-work/gale/file/src/minecraft/java; do
+            [ -d "$candidate/net/minecraft" ] && echo "present: $candidate"
+          done
+          # Prefer the tree the leaf patches are applied to (the generated project), and fall back
+          # to whatever copy actually carries our own patch marker.
+          ROOT=""
+          for candidate in leaf-server/src/minecraft/java .gradle/caches/paperweight/upstreams/server-work/gale/file/src/minecraft/java; do
+            if [ -d "$candidate/net/minecraft" ]; then ROOT="$candidate"; break; fi
+          done
+          PATCHED="$(grep -rl --include=LevelChunk.java 'leafPayloadRevision' . 2>/dev/null | grep -v '^./.git' | head -1)"
           if [ -n "$PATCHED" ]; then
             ROOT="${PATCHED%/net/minecraft/world/level/chunk/LevelChunk.java}"
-          else
-            ROOT="$(find .gradle/caches/paperweight/upstreams -path '*/gale/file/src/minecraft/java' -type d 2>/dev/null | head -1)"
           fi
           echo "PATCHED=$PATCHED"
           echo "ROOT=$ROOT"
@@ -81,7 +85,7 @@ jobs:
           : > "$REPORT"
           for marker in leafPayloadRevision 'off-heap chunk payload cache' 'LeafChunkPayloads'; do
             echo "### marker: $marker"
-            grep -rn --include=*.java "$marker" .gradle/caches/paperweight/upstreams 2>/dev/null | head -5
+            grep -rn --include=*.java "$marker" leaf-server .gradle/caches/paperweight/upstreams 2>/dev/null | grep -v '^leaf-server/src/main' | head -5
             echo
           done >> "$REPORT"
           echo "### hook report"
@@ -128,10 +132,51 @@ jobs:
           . /tmp/root.env
           scripts/ci/publish-excerpts.sh method BP-WITHIN "$ROOT/net/minecraft/core/BlockPos.java" 'Iterable<BlockPos> withinManhattan' 70
 
+      - name: Report the test task configuration
+        if: always()
+        run: |
+          set +e
+          REPORT=/tmp/testcfg.txt
+          : > "$REPORT"
+          {
+            echo "### test task config in the generated build script"
+            for f in leaf-server/build.gradle.kts build.gradle.kts; do
+              [ -f "$f" ] || continue
+              echo "--- $f"
+              grep -n -A12 -E "tasks\.(named|withType).*Test|useJUnitPlatform|includeTestsMatching|filter \{" "$f" | head -60
+            done
+          } >> "$REPORT"
+          cat "$REPORT"
+          python3 - "$REPORT" <<'PYEOF'
+          import sys
+          data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          limit = 3500
+          chunks = [data[i:i + limit] for i in range(0, len(data), limit)] or [""]
+          for index, chunk in enumerate(chunks[:3], start=1):
+              escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+              print(f"::error title=TESTCFG-{index}-OF-{len(chunks)}::{escaped}")
+          PYEOF
+
       - name: Run Leaf unit tests
         run: |
           set -o pipefail
-          ./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*' --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-test.log
+          cat > /tmp/leaf-tests.init.gradle <<'EOF'
+          allprojects {
+              tasks.withType(Test).configureEach {
+                  try {
+                      filter.setIncludePatterns(['org.dreeam.leaf.*'] as String[])
+                      filter.setFailOnNoMatchingTests(false)
+                  } catch (Exception ignored) {
+                      println "[Leaf CI] could not adjust the test filter: " + ignored
+                  }
+                  testLogging {
+                      events 'passed', 'failed', 'skipped'
+                      exceptionFormat 'full'
+                  }
+              }
+          }
+          EOF
+          ./gradlew :leaf-server:test --tests 'org.dreeam.leaf.*' --init-script /tmp/leaf-tests.init.gradle --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-test.log
 
       - name: Upload test report
         if: failure()

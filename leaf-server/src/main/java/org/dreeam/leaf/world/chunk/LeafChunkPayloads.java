@@ -50,17 +50,25 @@ public final class LeafChunkPayloads {
     }
 
     /**
-     * @return the cached payload, or {@code null} on a miss
+     * @return the cached payload for this chunk, or {@code null} when the caller has to encode it.
+     * The array is a fresh copy, so the caller may keep it.
      */
-    public static OffHeapByteArray get(final LevelChunk chunk) {
-        return OffHeapChunkPayloadCache.instance().get(key(chunk));
+    public static byte[] cachedOrNull(final LevelChunk chunk, final Object chunkPacketInfo) {
+        if (!isCacheable(chunk, chunkPacketInfo)) {
+            return null;
+        }
+        final OffHeapByteArray cached = OffHeapChunkPayloadCache.instance().get(key(chunk));
+        return cached == null ? null : cached.toByteArray();
     }
 
     /**
-     * Stores the freshly encoded payload. Never throws.
+     * Stores the freshly encoded payload for later re-use. Never throws and never fails the caller:
+     * a rejected or failed store only costs one re-encoding next time.
      */
-    public static void put(final LevelChunk chunk, final byte[] payload) {
-        OffHeapChunkPayloadCache.instance().put(key(chunk), payload);
+    public static void store(final LevelChunk chunk, final Object chunkPacketInfo, final byte[] payload) {
+        if (isCacheable(chunk, chunkPacketInfo)) {
+            OffHeapChunkPayloadCache.instance().put(key(chunk), payload);
+        }
     }
 
     private static long key(final LevelChunk chunk) {

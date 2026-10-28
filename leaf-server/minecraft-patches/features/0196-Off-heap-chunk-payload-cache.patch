@@ -7,29 +7,25 @@ Subject: [PATCH] Off-heap chunk payload cache: reuse the encoded chunk data
 diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
 --- a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
 +++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
-@@ -76,9 +76,25 @@
+@@ -76,9 +76,21 @@
          }
  
 +        // Leaf start - off-heap chunk payload cache
-+        final org.dreeam.leaf.perf.offheap.OffHeapByteArray leafCachedPayload =
-+            org.dreeam.leaf.world.chunk.LeafChunkPayloads.isCacheable(levelChunk, chunkPacketInfo)
-+                ? org.dreeam.leaf.world.chunk.LeafChunkPayloads.get(levelChunk)
-+                : null;
++        final byte[] leafCachedPayload =
++            org.dreeam.leaf.world.chunk.LeafChunkPayloads.cachedOrNull(levelChunk, chunkPacketInfo);
 +        if (leafCachedPayload != null) {
 +            // cache hit: one array copy out of native memory instead of re-encoding every section
-+            this.buffer = leafCachedPayload.toByteArray();
++            this.buffer = leafCachedPayload;
 +        } else {
-+        // Leaf end - off-heap chunk payload cache
++            // Leaf end - off-heap chunk payload cache
          this.buffer = new byte[calculateChunkSize(levelChunk)];
          // Paper start - Anti-Xray - Add chunk packet info
          if (chunkPacketInfo != null) {
              chunkPacketInfo.setBuffer(this.buffer);
          }
          extractChunkData(new FriendlyByteBuf(this.getWriteBuffer()), levelChunk, chunkPacketInfo);
-+        // Leaf start - off-heap chunk payload cache
-+            if (org.dreeam.leaf.world.chunk.LeafChunkPayloads.isCacheable(levelChunk, chunkPacketInfo)) {
-+                org.dreeam.leaf.world.chunk.LeafChunkPayloads.put(levelChunk, this.buffer);
-+            }
++            // Leaf start - off-heap chunk payload cache
++            org.dreeam.leaf.world.chunk.LeafChunkPayloads.store(levelChunk, chunkPacketInfo, this.buffer);
 +        }
 +        // Leaf end - off-heap chunk payload cache
          this.blockEntitiesData = Lists.newArrayList();
