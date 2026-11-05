@@ -311,6 +311,43 @@ jobs:
           set -o pipefail
           ./gradlew :leaf-server:leafUnitTest --init-script /tmp/leaf-tests.init.gradle --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-test.log
 
+      - name: Explain a failed test build
+        if: always()
+        run: |
+          set +e
+          LOG=/tmp/gradle-test.log
+          if ! grep -qE "BUILD FAILED|error:" "$LOG" 2>/dev/null; then
+            echo "no build failure in the gradle log"
+            exit 0
+          fi
+          OUT=/tmp/builderr.txt
+          {
+            echo "### gradle failure extract"
+            grep -nE "\.java:[0-9]+: (error|warning):|^e: |^> Task .*FAILED|^FAILURE: |^\* What went wrong|^Execution failed for task" "$LOG" | head -60
+            echo "--- first lines of the failing task ---"
+            grep -nE "^> Task .*FAILED" "$LOG" | head -3
+            grep -A 25 "What went wrong" "$LOG" | head -40
+          } > "$OUT" 2>&1
+          cat "$OUT"
+          python3 - "$OUT" <<'PYEOF'
+          import sys
+          lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+          chunks, current = [], ""
+          for line in lines:
+              escaped = line.replace("%", "%25").replace("\r", "")
+              candidate = (current + "%0A" + escaped) if current else escaped
+              if len(candidate) > 3000:
+                  chunks.append(current)
+                  current = escaped
+              else:
+                  current = candidate
+          if current or not chunks:
+              chunks.append(current)
+          total = len(chunks)
+          for index, chunk in enumerate(chunks[:4], start=1):
+              print(f"::error title=BUILDERR-{index}-OF-{total}::build failure {index}/{total}%0A{chunk}")
+          PYEOF
+
       - name: Dump the test runtime classpath for the alternative VM run
         if: always()
         run: |
