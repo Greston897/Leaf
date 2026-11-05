@@ -124,15 +124,53 @@
   `performance.*` / `async.*` переключатели Leaf **выключены** (только читает yml), готовые команды
   spark/JFR.
 
-### Про «+2 ГБ из-за SpigotLibraryLoader»
+### Про «+2 ГБ из-за SpigotLibraryLoader» — что сделано
 
-По порядку вероятности:
+Раньше здесь был список гипотез. Теперь по этому пункту есть измерения и два патча.
 
-1. **metaspace** — library loader грузит jar'ы библиотек, классы живут вне heap, лимита по умолчанию
-   нет. Лечится `-XX:MaxMetaspaceSize=512m` + AppCDS.
-2. **direct memory** — Netty-арены, чанк-буферы, zstd/lz4. Не видна в `-Xmx`, лечится
-   `-XX:MaxDirectMemorySize` (в генераторе флагов = heap/2).
-3. **растущий heap без `AlwaysPreTouch`** — RSS поднимается ступеньками и выглядит как утечка.
+**Что именно дорого в спихотовом library loader'е (`org.bukkit.plugin.java.LibraryLoader`):**
+
+1. **Конструктор строил весь Maven/Aether-граф** — service locator, `BasicRepositoryConnectorFactory`,
+   `HttpTransporterFactory`, сессию с checksum policy и transfer listener'ом. Это plexus + sisu +
+   httpclient в metaspace, и всё это оставалось жить до выключения сервера, **даже если ни один
+   плагин не объявил ни одной `libraries`**.
+2. **Каждому плагину — свой `URLClassLoader`.** Если библиотеку объявляют десять плагинов
+   (adventure, HikariCP, sqlite-jdbc, kotlin-stdlib, gson — типичный набор), её классы попадают в
+   metaspace десять раз.
+
+**Патч `leaf-api/paper-patches/features/0014-…`:**
+
+* Maven-граф строится **лениво**, при первом плагине, который реально просит библиотеку
+  (`initMavenRepository()`), и ровно один раз;
+* плагины с **идентичным** набором библиотек (тот же список jar'ов в том же порядке) получают один
+  общий `URLClassLoader` (`SharedLibraryClassLoader`, у которого `close()` — no-op, чтобы выгрузка
+  одного плагина не выдернула библиотеки у остальных);
+* разные наборы — разные загрузчики, порядок classpath не меняется, версии не меняются;
+* выключатель, если нужен старый путь: `-Dleaf.libraryLoader.shareClassLoaders=false`,
+  предел общего кеша: `-Dleaf.libraryLoader.maxSharedLoaders=256`.
+
+**Отчёт `MemoryFootprint`** (новый класс, печатается на старте и на выключении):
+
+```
+[Leaf] [boot] heap used 22 MiB / committed 252 MiB / max 8192 MiB | metaspace 8 MiB / 9 MiB | code cache 6 MiB | direct 0 MiB / 0 MiB | mapped 0 MiB | classes 3201
+[Leaf] [boot] process rss 312 MiB / peak 340 MiB
+[Leaf] [boot] libraries: 42 jars, 180 MiB plugins: 57 jars, 210 MiB
+[Leaf] [shutdown] Library loader: 6 shared library class loaders, 11 reuses
+```
+
+Это и есть ответ на «куда ушли 2 ГБ»: heap ограничен `-Xmx` и обычно ни при чём, а metaspace,
+direct-пулы и RSS процесса — нет. Отчёт ничего не стоит (MXBeans + один файл `/proc/self/status`),
+отключается `-Dleaf.memoryReport=false`.
+
+**Что осталось за пределами кода** (честно, чтобы не искать «серебряную пулю»):
+
+* metaspace по умолчанию **не ограничен** — если плагины грузят много классов, он растёт до предела
+  памяти машины; `-XX:MaxMetaspaceSize=512m` делает проблему видимой (OOM вместо тихого роста), но
+  это флаг, а флаги ты просил не навязывать;
+* `libraries/` — это распакованные jar'ы на диске, сами по себе в ОЗУ не тянут; тянут их открытые
+  `JarFile`/`URLClassLoader`, и именно их количество теперь меньше;
+* если конкретный плагин тянет мега-библиотеку (например, полный kotlin-stdlib), это его выбор:
+  дедупликация помогает, только когда такую же библиотеку тянет кто-то ещё.
 
 ---
 
@@ -310,6 +348,7 @@ jdk.incubator.vector` при запуске и отсутствует в jlink'�
 | 4 | `0198-BlockPos-betweenClosed-without-temporary-positions.patch` | `BlockPos.betweenClosed(AABB)` и `(BlockPos, BlockPos)` без промежуточных объектов | −2 аллокации и −6 виртуальных вызовов на каждый обход AABB |
 | 5 | `0199-ServerChunkCache-cheaper-spawning-and-random-tick-loops.patch` | `ServerChunkCache.tickChunks`: инварианты цикла спавна вынесены, оба горячих цикла идут по индексу | заметно на сервере с игроками: `isEmpty()`/`getWorldBorder()` больше не вызываются на каждый чанк |
 | 6 | `0200-LevelChunk-getBlockStateFinal-single-section-read.patch` | `getBlockStateFinal` читает `sections[i]` один раз в локальную переменную | самый горячий метод чтения блока в игре, −1 чтение массива на вызов |
+| 7 | `leaf-api/paper-patches/features/0014-Share-library-class-loaders-and-build-maven-on-demand.patch` | Maven/Aether-граф строится лениво, плагины с одинаковым набором библиотек делят один `URLClassLoader` | минус дубли классов библиотек в metaspace, минус открытые jar'ы, см. §2 |
 
 Плюс `world/chunk/LeafChunkPayloads.java` — вся логика решения кэша (`cachedOrNull` / `store` /
 `isCacheable` / ключ), чтобы патчи NMS оставались двумя строчками.

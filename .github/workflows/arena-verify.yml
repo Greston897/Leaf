@@ -95,7 +95,7 @@ jobs:
                         'one class loader per identical library set' \
                         'lazy maven stack'; do
             echo "### marker: $marker"
-            grep -rn --include=*.java "$marker" leaf-server .gradle/caches/paperweight/upstreams 2>/dev/null | grep -v '^leaf-server/src/main' | head -5
+            grep -rn --include=*.java "$marker" leaf-server paper-api leaf-api .gradle/caches/paperweight/upstreams 2>/dev/null | grep -v '^leaf-server/src/main' | head -5
             echo
           done >> "$REPORT"
           echo "### hook report"

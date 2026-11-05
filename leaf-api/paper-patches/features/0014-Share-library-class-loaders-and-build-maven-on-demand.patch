@@ -16,14 +16,22 @@ plugins whose resolved library sets are identical (same jars, same order) share 
 single loader. Both are purely about memory: the resolved artifacts, the classpath
 order and the isolation between different library sets are unchanged.
 
--Knobs: -Dleaf.libraryLoader.shareClassLoaders=false restores the old behaviour,
+Knobs: -Dleaf.libraryLoader.shareClassLoaders=false restores the old behaviour,
 -Dleaf.libraryLoader.maxSharedLoaders caps the shared map (default 256).
 
 diff --git a/src/main/java/org/bukkit/plugin/java/LibraryLoader.java b/src/main/java/org/bukkit/plugin/java/LibraryLoader.java
-index 330553f..e5a6877 100644
+index 330553f..8303e16 100644
 --- a/src/main/java/org/bukkit/plugin/java/LibraryLoader.java
 +++ b/src/main/java/org/bukkit/plugin/java/LibraryLoader.java
-@@ -43,9 +43,20 @@ public class LibraryLoader
+@@ -8,6 +8,7 @@ import java.net.URLClassLoader;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.logging.Level;
+ import java.util.logging.Logger;
+ import org.apache.maven.repository.internal.MavenRepositorySystemUtils;
+@@ -43,9 +44,20 @@ public class LibraryLoader
  {
  
      private final Logger logger;
@@ -47,7 +55,7 @@ index 330553f..e5a6877 100644
      public static java.util.function.BiFunction<URL[], ClassLoader, URLClassLoader> LIBRARY_LOADER_FACTORY; // Paper - rewrite reflection in libraries
      public static java.util.function.Function<List<java.nio.file.Path>, List<java.nio.file.Path>> REMAPPER; // Paper - remap libraries
  
-@@ -59,6 +70,22 @@ public class LibraryLoader
+@@ -59,6 +71,22 @@ public class LibraryLoader
      public LibraryLoader(@NotNull Logger logger)
      {
          this.logger = logger;
@@ -70,7 +78,7 @@ index 330553f..e5a6877 100644
  
          DefaultServiceLocator locator = MavenRepositorySystemUtils.newServiceLocator();
          locator.addService( RepositoryConnectorFactory.class, BasicRepositoryConnectorFactory.class );
-@@ -118,6 +145,7 @@ public class LibraryLoader
+@@ -118,6 +146,7 @@ public class LibraryLoader
          }
  
          DependencyResult result;
@@ -78,7 +86,7 @@ index 330553f..e5a6877 100644
          if (!dependencies.isEmpty()) try // Paper - plugin loader api
          {
              result = repository.resolveDependencies( session, new DependencyRequest( new CollectRequest( (Dependency) null, dependencies, repositories ), null ) );
-@@ -161,14 +189,74 @@ public class LibraryLoader
+@@ -161,14 +190,85 @@ public class LibraryLoader
          }
  
          // Paper start - rewrite reflection in libraries
@@ -100,9 +108,20 @@ index 330553f..e5a6877 100644
 +            }
 +            if ( SHARED_LOADERS.size() < MAX_SHARED_LOADERS )
 +            {
-+                final URLClassLoader leafFresh = new SharedLibraryClassLoader( leafUrls, getClass().getClassLoader() );
-+                final URLClassLoader leafRaced = SHARED_LOADERS.putIfAbsent( leafKey, leafFresh );
-+                return leafRaced != null ? leafRaced : leafFresh;
++                final AtomicBoolean leafCreated = new AtomicBoolean();
++                final URLClassLoader leafShared = SHARED_LOADERS.computeIfAbsent( leafKey, key ->
++                {
++                    leafCreated.set( true );
++                    return new SharedLibraryClassLoader( leafUrls, getClass().getClassLoader() );
++                } );
++                if ( leafShared != null )
++                {
++                    if ( !leafCreated.get() )
++                    {
++                        SHARED_LOADER_HITS.incrementAndGet();
++                    }
++                    return leafShared;
++                }
 +            }
 +        }
 +        // Leaf end - one class loader per identical library set
