@@ -278,8 +278,29 @@ jobs:
                   task.doLast {
                       def out = project.layout.buildDirectory.file('leaf-test-classpath.txt').get().asFile
                       out.parentFile.mkdirs()
-                      out.text = project.sourceSets.test.runtimeClasspath.asPath
-                      println "[Leaf CI] test classpath written to ${out} (${out.text.length()} chars)"
+                      def entries = new ArrayList(project.sourceSets.test.runtimeClasspath.files)
+                      // Gradle injects junit-platform-launcher into its own test worker, so it is not
+                      // part of the runtime classpath - but the plain-java launcher needs it. Reuse
+                      // the platform version that is already on the classpath.
+                      def commons = entries.find { it.name.startsWith('junit-platform-commons-') }
+                      if (commons != null) {
+                          def version = commons.name.substring('junit-platform-commons-'.length())
+                          version = version.substring(0, version.length() - '.jar'.length())
+                          try {
+                              def launcher = project.configurations.detachedConfiguration(
+                                  project.dependencies.create("org.junit.platform:junit-platform-launcher:${version}"))
+                              launcher.transitive = true
+                              entries.addAll(launcher.files)
+                              out.text = entries.join(File.pathSeparator)
+                              println "[Leaf CI] test classpath written to ${out} (${entries.size()} entries, launcher ${version})"
+                          } catch (Exception exception) {
+                              out.text = entries.join(File.pathSeparator)
+                              println "[Leaf CI] launcher ${version} could not be resolved: ${exception.message}"
+                          }
+                      } else {
+                          out.text = entries.join(File.pathSeparator)
+                          println "[Leaf CI] no junit-platform-commons on the classpath"
+                      }
                   }
               }
           }
@@ -477,6 +498,7 @@ jobs:
       # ---------------------------------------------------------------------------------------
       - name: Setup GraalVM 25
         id: graalvm
+        if: always()
         continue-on-error: true
         uses: actions/setup-java@v4
         with:
@@ -505,7 +527,7 @@ jobs:
               exit 0
             fi
             "$GRAAL_BIN" -version 2>&1 | head -2
-            CP="$(cat "$CP_FILE"):leaf-server/build/classes/java/test"
+            CP="$(cat "$CP_FILE"):leaf-server/build/classes/java/test:leaf-server/build/resources/test"
             mkdir -p /tmp/altrun
             cat > /tmp/altrun/AltVmRunner.java <<'JAVA'
           import org.junit.platform.launcher.Launcher;

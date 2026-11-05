@@ -86,11 +86,17 @@ public class LagCompensation {
             currentMillis = now;
             currentTick = now;
 
-            addToHistory(currentTps());
+            // Never feed the "no sample yet" sentinel (-1) into the average: the old code did, which
+            // dragged the 40 sample window down by 5% for the first 40 ticks after start and made the
+            // fluid tick compensation fire on boot when nothing was late.
+            final double current = currentTps();
+            if (current >= 0.0D) {
+                addToHistory(current);
+            }
             clearMissedTicks();
             missedTick();
             // Everything above is what readers used to recompute per call; do it once.
-            mostAccurateTps = Math.min(currentTps(), averageTps());
+            mostAccurateTps = current >= 0.0D ? Math.min(current, averageTps()) : -1.0D;
         }
 
         private static void addToHistory(final double tps) {

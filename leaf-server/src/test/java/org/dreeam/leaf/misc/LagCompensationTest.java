@@ -14,11 +14,25 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class LagCompensationTest {
 
+    /**
+     * The tracker is process wide state, so tests must not assume a fresh instance - JUnit may run
+     * any method first. This one pins the relations that hold in every state instead: TPS never
+     * exceeds {@code MAX_TPS}, a negative TPS means "no sample yet", and the value the hot path reads
+     * is exactly {@code min(current, average)}.
+     */
     @Test
-    void unknownTpsIsMinusOneUntilTwoTicks() {
-        assertEquals(-1.0D, LagCompensation.TPSCalculator.getTPS(), 0.0D);
-        assertEquals(-1.0D, LagCompensation.TPSCalculator.getMostAccurateTPS(), 0.0D);
-        assertEquals(0L, LagCompensation.TPSCalculator.getMSPT());
+    void derivedValuesStayConsistentInEveryState() {
+        final double tps = LagCompensation.TPSCalculator.getTPS();
+        final double average = LagCompensation.TPSCalculator.getAverageTPS();
+        final double mostAccurate = LagCompensation.TPSCalculator.getMostAccurateTPS();
+
+        assertTrue(tps <= LagCompensation.TPSCalculator.MAX_TPS, "tps was " + tps);
+        assertTrue(average >= 0.1D && average <= LagCompensation.TPSCalculator.MAX_TPS,
+            "the average must be a real TPS value, was " + average);
+        assertTrue(mostAccurate <= LagCompensation.TPSCalculator.MAX_TPS, "most accurate was " + mostAccurate);
+        assertEquals(Math.min(tps, average), mostAccurate, 0.001D,
+            "the cached value must equal min(current, average)");
+        assertTrue(LagCompensation.TPSCalculator.getMSPT() >= 0L);
     }
 
     @Test
@@ -28,10 +42,15 @@ class LagCompensationTest {
         LagCompensation.TPSCalculator.onTick();
         sleep(2L);
         LagCompensation.TPSCalculator.onTick();
+        sleep(2L);
 
         final double tps = LagCompensation.TPSCalculator.getTPS();
         assertTrue(tps > 0.0D && tps <= LagCompensation.TPSCalculator.MAX_TPS, "tps was " + tps);
         assertTrue(LagCompensation.TPSCalculator.getMSPT() >= 0L);
+        // the start-up sentinel must not have polluted the window: an average that is still 0.1 or
+        // negative would mean only sentinels were recorded
+        assertTrue(LagCompensation.TPSCalculator.getAverageTPS() > 0.1D,
+            "average was " + LagCompensation.TPSCalculator.getAverageTPS());
 
         // a delay of 5 ticks stays at least 1, it never collapses to 0
         final int delay = LagCompensation.tt20(5, true);
