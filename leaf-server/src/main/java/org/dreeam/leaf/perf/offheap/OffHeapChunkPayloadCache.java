@@ -1,9 +1,10 @@
 package org.dreeam.leaf.perf.offheap;
 
-import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
-import it.unimi.dsi.fastutil.longs.LongArrayList;
-import it.unimi.dsi.fastutil.longs.LongIterator;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.RemovalCause;
 
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -30,10 +31,14 @@ import java.util.concurrent.atomic.AtomicLong;
  * a mutable chunk without a revision will serve stale chunks: that is why this class is never wired
  * up automatically and why it is disabled unless {@code -Dleaf.offHeap.chunkCacheMB} is set.
  * <p>
- * The cache is a bounded, approximate LRU: when the budget is exceeded it drops entries in hash order
- * until it is back under 75 % of the budget. That is enough for a workload where a chunk payload is
- * either re-sent within a few seconds (a player moving, a group of players entering the same area) or
- * never.
+ * <b>Eviction and lifetime.</b> The cache is a Caffeine cache bounded by <i>weight</i>, where the weight
+ * of an entry is its exact native size in bytes, so {@code -Dleaf.offHeap.chunkCacheMB} is a real cap on
+ * native memory instead of a rough hint. Entries also expire after a period without access
+ * ({@code -Dleaf.offHeap.chunkCacheExpireMinutes}, default 10), which matters more than it looks:
+ * the key of a payload contains the chunk revision and a coarse epoch, so a chunk that keeps changing
+ * produces a new key every time, and the old keys are dead the moment they are written. A pure
+ * budget-based cache keeps those dead entries until something else evicts them, i.e. it can fill up
+ * completely with payloads that will never be requested again. Expiry reclaims them.
  */
 public final class OffHeapChunkPayloadCache {
 
@@ -42,9 +47,11 @@ public final class OffHeapChunkPayloadCache {
 
     private static final OffHeapChunkPayloadCache INSTANCE = new OffHeapChunkPayloadCache();
 
-    private final Long2ObjectOpenHashMap<OffHeapByteArray> entries = new Long2ObjectOpenHashMap<>(256);
+    private static final long EXPIRE_MINUTES = readLongProperty("leaf.offHeap.chunkCacheExpireMinutes", 10L);
+
+    private final Cache<Long, OffHeapByteArray> entries;
     private final long budgetBytes;
-    private long usedBytes;
+    private final AtomicLong usedBytes = new AtomicLong();
     private final AtomicLong hits = new AtomicLong();
     private final AtomicLong misses = new AtomicLong();
 
@@ -57,6 +64,22 @@ public final class OffHeapChunkPayloadCache {
      */
     OffHeapChunkPayloadCache(final long budgetBytes) {
         this.budgetBytes = budgetBytes;
+        // Maintenance runs on the calling thread: the accounting below must be exact right after a
+        // write (a test, a report), and a chunk packet is never written from a latency critical loop
+        // in a way that a synchronous eviction pass would break.
+        final Caffeine<Long, OffHeapByteArray> builder = Caffeine.<Long, OffHeapByteArray>newBuilder()
+            .maximumWeight(Math.max(1L, budgetBytes))
+            .weigher((Long key, OffHeapByteArray value) -> (int) Math.min(Integer.MAX_VALUE, value.byteSize()))
+            .executor(Runnable::run)
+            .removalListener((Long key, OffHeapByteArray value, RemovalCause cause) -> {
+                if (value != null) {
+                    this.usedBytes.addAndGet(-value.byteSize());
+                }
+            });
+        if (EXPIRE_MINUTES > 0L) {
+            builder.expireAfterAccess(EXPIRE_MINUTES, TimeUnit.MINUTES);
+        }
+        this.entries = builder.build();
     }
 
     public static OffHeapChunkPayloadCache instance() {
@@ -104,8 +127,8 @@ public final class OffHeapChunkPayloadCache {
      * @return the cached payload, or {@code null} on a miss. The returned array is immutable and can
      * be read concurrently by any thread.
      */
-    public synchronized OffHeapByteArray get(final long key) {
-        final OffHeapByteArray cached = this.entries.get(key);
+    public OffHeapByteArray get(final long key) {
+        final OffHeapByteArray cached = this.entries.getIfPresent(key);
         if (cached != null) {
             this.hits.incrementAndGet();
             return cached;
@@ -118,62 +141,55 @@ public final class OffHeapChunkPayloadCache {
      * Stores a payload. Never throws: a failed allocation (direct memory is a separate, capped pool)
      * simply results in a cache miss next time.
      */
-    public synchronized void put(final long key, final byte[] payload) {
+    public void put(final long key, final byte[] payload) {
         if (this.budgetBytes <= 0L || payload == null || payload.length == 0 || payload.length > MAX_ENTRY_BYTES) {
             return;
         }
 
-        final OffHeapByteArray previous = this.entries.get(key);
-        if (previous != null) {
-            this.usedBytes -= previous.byteSize();
-        }
-
+        final OffHeapByteArray copy;
         try {
-            final OffHeapByteArray copy = OffHeapByteArray.copyOf(payload);
-            this.entries.put(key, copy);
-            this.usedBytes += copy.byteSize();
+            copy = OffHeapByteArray.copyOf(payload);
         } catch (OutOfMemoryError | RuntimeException allocationFailure) {
-            this.entries.remove(key);
+            // direct memory is a separate, capped pool: a failed allocation simply means a miss later
             return;
         }
 
-        if (this.usedBytes > this.budgetBytes) {
-            evictUntilBelow(this.budgetBytes - (this.budgetBytes >> 2));
+        // A replaced value fires the removal listener with REPLACED, which takes the old size off the
+        // counter; adding the new size afterwards keeps the accounting balanced.
+        this.usedBytes.addAndGet(copy.byteSize());
+        this.entries.asMap().put(key, copy);
+        if (this.usedBytes.get() > this.budgetBytes) {
+            this.entries.cleanUp();
         }
     }
 
-    public synchronized void invalidate(final long key) {
-        final OffHeapByteArray removed = this.entries.remove(key);
-        if (removed != null) {
-            this.usedBytes -= removed.byteSize();
-        }
+    public void invalidate(final long key) {
+        this.entries.invalidate(key);
+        this.entries.cleanUp();
     }
 
-    public synchronized void clear() {
-        this.entries.clear();
-        this.usedBytes = 0L;
+    public void clear() {
+        this.entries.invalidateAll();
+        this.entries.cleanUp();
+        this.usedBytes.set(0L);
     }
 
-    private void evictUntilBelow(final long targetBytes) {
-        // Hash order is good enough: the entries are all equally recent as far as the cache knows,
-        // and a wrong choice only costs one re-serialisation.
-        final LongArrayList toDrop = new LongArrayList(64);
-        final LongIterator iterator = this.entries.keySet().iterator();
-        while (this.usedBytes > targetBytes && iterator.hasNext()) {
-            final long candidate = iterator.nextLong();
-            toDrop.add(candidate);
-            final OffHeapByteArray value = this.entries.get(candidate);
-            if (value != null) {
-                this.usedBytes -= value.byteSize();
-            }
-        }
-        for (int i = 0, size = toDrop.size(); i < size; i++) {
-            this.entries.remove(toDrop.getLong(i));
-        }
+    public long usedBytes() {
+        return Math.max(0L, this.usedBytes.get());
     }
 
-    public synchronized long usedBytes() {
-        return this.usedBytes;
+    /**
+     * @return number of cached payloads, for diagnostics
+     */
+    public long size() {
+        return this.entries.estimatedSize();
+    }
+
+    /**
+     * @return the lifetime of an unused entry in minutes, 0 when entries never expire
+     */
+    public static long expireMinutes() {
+        return EXPIRE_MINUTES;
     }
 
     public long hits() {
@@ -197,7 +213,8 @@ public final class OffHeapChunkPayloadCache {
                 System.out.println("[Leaf] Chunk payload cache: " + cache.hits() + " hits, "
                     + cache.misses() + " misses (" + String.format(java.util.Locale.ROOT, "%.1f", hitRate)
                     + "%), " + (cache.usedBytes() >> 10) + " KiB / " + (cache.budgetBytes() >> 10)
-                    + " KiB of native memory");
+                    + " KiB of native memory in " + cache.size() + " entries, unused entries expire after "
+                    + expireMinutes() + " min");
             }, "Leaf chunk payload cache report"));
         } catch (RuntimeException ignored) {
             // shutting down already, or a security manager - never a reason to fail

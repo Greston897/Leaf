@@ -1,6 +1,6 @@
 package org.dreeam.leaf.world.block;
 
-import it.unimi.dsi.fastutil.objects.Object2BooleanOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2BooleanOpenHashMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
@@ -20,7 +20,23 @@ public class OptimizedPoweredRails {
 
     private static final int UPDATE_FORCE_PLACE = UPDATE_MOVE_BY_PISTON | UPDATE_KNOWN_SHAPE | UPDATE_CLIENTS;
 
-    private static final Object2BooleanOpenHashMap<BlockPos> CHECKED_POS_POOL = new Object2BooleanOpenHashMap<>();
+    // Leaf start - key the rail traversal by the packed position instead of by BlockPos
+    // The pool used to be an Object2BooleanOpenHashMap<BlockPos>: every visited rail boxed a position
+    // into the map (and fastutil's hash maps never give the table memory back, clear() only zeroes
+    // it), so after one long rail network the server kept that table - and the BlockPos objects that
+    // were still referenced - for the rest of the uptime. A long keyed map holds no objects at all and
+    // is a third of the size per entry.
+    private static final Long2BooleanOpenHashMap CHECKED_POS_POOL = new Long2BooleanOpenHashMap();
+    /** hard bound so a pathological rail network cannot grow the pool without limit */
+    private static final int MAX_TRACKED_POSITIONS = Integer.getInteger("leaf.rails.maxTrackedPositions", 8192);
+    // Leaf end - key the rail traversal by the packed position instead of by BlockPos
+
+    /**
+     * Leaf - number of positions the last rail traversal kept around, for the memory report.
+     */
+    public static int trackedPositions() {
+        return CHECKED_POS_POOL.size();
+    }
 
     private static void giveShapeUpdate(Level level, BlockState state, BlockPos pos, BlockPos fromPos, Direction direction) {
         BlockState oldState = level.getBlockState(pos);
@@ -35,6 +51,8 @@ public class OptimizedPoweredRails {
     }
 
     public static void updateState(PoweredRailBlock self, BlockState state, Level level, BlockPos pos) {
+        // Leaf - never inherit entries from a previous (possibly aborted) traversal
+        CHECKED_POS_POOL.clear();
         boolean shouldBePowered = level.hasNeighborSignal(pos) ||
             findPoweredRailSignalFaster(self, level, pos, state, true, 0, CHECKED_POS_POOL) ||
             findPoweredRailSignalFaster(self, level, pos, state, false, 0, CHECKED_POS_POOL);
@@ -54,9 +72,9 @@ public class OptimizedPoweredRails {
 
     private static boolean findPoweredRailSignalFaster(PoweredRailBlock self, Level level, BlockPos pos,
                                                        boolean searchForward, int distance, RailShape shape,
-                                                       Object2BooleanOpenHashMap<BlockPos> checkedPos) {
+                                                       Long2BooleanOpenHashMap checkedPos) {
         BlockState blockState = level.getBlockState(pos);
-        boolean speedCheck = checkedPos.containsKey(pos) && checkedPos.getBoolean(pos);
+        boolean speedCheck = checkedPos.get(pos.asLong()); // absent == false, same as containsKey && getBoolean
         if (speedCheck) {
             return level.hasNeighborSignal(pos) ||
                 findPoweredRailSignalFaster(self, level, pos, blockState, searchForward, distance + 1, checkedPos);
@@ -86,7 +104,7 @@ public class OptimizedPoweredRails {
 
     private static boolean findPoweredRailSignalFaster(PoweredRailBlock self, Level level,
                                                        BlockPos pos, BlockState state, boolean searchForward, int distance,
-                                                       Object2BooleanOpenHashMap<BlockPos> checkedPos) {
+                                                       Long2BooleanOpenHashMap checkedPos) {
         if (distance >= level.purpurConfig.railActivationRange) return false;
         int x = pos.getX();
         int y = pos.getY();
@@ -156,9 +174,11 @@ public class OptimizedPoweredRails {
     private static void powerLane(PoweredRailBlock self, Level level, BlockPos pos,
                                   BlockState mainState, RailShape railShape) {
         level.setBlock(pos, mainState.setValue(POWERED, true), UPDATE_FORCE_PLACE);
-        Object2BooleanOpenHashMap<BlockPos> checkedPos = CHECKED_POS_POOL;
+        Long2BooleanOpenHashMap checkedPos = CHECKED_POS_POOL;
         checkedPos.clear();
-        checkedPos.put(pos, true);
+        if (checkedPos.size() < MAX_TRACKED_POSITIONS) {
+            checkedPos.put(pos.asLong(), true);
+        }
         int[] count = new int[2];
         if (railShape == RailShape.NORTH_SOUTH) { // Order: +z, -z
             for (int i = 0; i < NORTH_SOUTH_DIR.length; ++i) {
@@ -192,22 +212,23 @@ public class OptimizedPoweredRails {
     }
 
     private static void setRailPositionsPower(PoweredRailBlock self, Level level, BlockPos pos,
-            Object2BooleanOpenHashMap<BlockPos> checkedPos, int[] count, int i, Direction dir) {
+            Long2BooleanOpenHashMap checkedPos, int[] count, int i, Direction dir) {
         final int railPowerLimit = level.purpurConfig.railActivationRange;
         for (int z = 1; z < railPowerLimit; z++) {
             BlockPos newPos = pos.relative(dir, z);
             BlockState state = level.getBlockState(newPos);
-            if (checkedPos.containsKey(newPos)) {
-                if (!checkedPos.getBoolean(newPos))
+            final long newPosKey = newPos.asLong();
+            if (checkedPos.containsKey(newPosKey)) {
+                if (!checkedPos.get(newPosKey))
                     break;
                 count[i]++;
             } else if (!state.is(self) || state.getValue(POWERED) || !(level.hasNeighborSignal(newPos) ||
                     findPoweredRailSignalFaster(self, level, newPos, state, true, 0, checkedPos) ||
                     findPoweredRailSignalFaster(self, level, newPos, state, false, 0, checkedPos))) {
-                checkedPos.put(newPos, false);
+                if (checkedPos.size() < MAX_TRACKED_POSITIONS) checkedPos.put(newPosKey, false);
                 break;
             } else {
-                checkedPos.put(newPos, true);
+                if (checkedPos.size() < MAX_TRACKED_POSITIONS) checkedPos.put(newPosKey, true);
                 if (!state.getValue(POWERED)) {
                     level.setBlock(newPos, state.setValue(POWERED, true), UPDATE_FORCE_PLACE);
                 }
@@ -218,7 +239,7 @@ public class OptimizedPoweredRails {
 
     private static void setRailPositionsDePower(PoweredRailBlock self, Level level, BlockPos pos,
         int[] count, int i, Direction dir) {
-        Object2BooleanOpenHashMap<BlockPos> checkedPos = CHECKED_POS_POOL;
+        Long2BooleanOpenHashMap checkedPos = CHECKED_POS_POOL;
         checkedPos.clear();
         final int railPowerLimit = level.purpurConfig.railActivationRange;
         for (int z = 1; z < railPowerLimit; z++) {

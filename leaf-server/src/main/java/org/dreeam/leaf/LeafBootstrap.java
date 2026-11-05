@@ -22,7 +22,7 @@ public class LeafBootstrap {
         // Boot and shutdown snapshot of heap / metaspace / direct memory / RSS and of the jar
         // directories, so "where did the 2 GB go" is answered with numbers.
         MemoryFootprint.install();
-        reportLibraryLoaders();
+        reportLeafCaches();
         // Only does something when -Dleaf.offHeap.chunkCacheMB is set.
         org.dreeam.leaf.perf.offheap.OffHeapChunkPayloadCache.installShutdownReport();
         // Leaf end - boot time tuning
@@ -31,24 +31,37 @@ public class LeafBootstrap {
     }
 
     /**
-     * Leaf - prints how many library class loaders were shared between plugins, once, at shutdown.
+     * Leaf - one line per Leaf owned cache, printed at shutdown.
      * <p>
-     * The counters live in {@code org.bukkit.plugin.java.LibraryLoader}; reading them at boot would
-     * class load the maven stack this server is trying to avoid, so the report runs at shutdown when
-     * every plugin that wanted a library already asked for one.
+     * Everything here is pooled state that survives ticks: shared library class loaders, the path
+     * finding evaluator pool and the powered rail traversal pool. Reading them at shutdown (when the
+     * classes are loaded anyway) means a server that holds on to too much tells you which pool it is,
+     * instead of forcing a heap dump.
      */
-    private static void reportLibraryLoaders() {
+    private static void reportLeafCaches() {
         try {
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                try {
-                    System.out.println("[Leaf] Library loader: "
-                        + org.bukkit.plugin.java.LibraryLoader.sharedLoaderStats());
-                } catch (Throwable ignored) {
-                    // the class may not even have been loaded if no plugin used libraries
-                }
-            }, "Leaf library loader report"));
+            Runtime.getRuntime().addShutdownHook(new Thread(LeafBootstrap::printLeafCaches, "Leaf cache report"));
         } catch (Throwable ignored) {
             // never break boot because of a diagnostic
+        }
+    }
+
+    private static void printLeafCaches() {
+        try {
+            System.out.println("[Leaf] Library loader: " + org.bukkit.plugin.java.LibraryLoader.sharedLoaderStats());
+        } catch (Throwable ignored) {
+            // the class may not even have been loaded if no plugin used libraries
+        }
+        try {
+            System.out.println("[Leaf] Pathfinding pool: " + org.dreeam.leaf.async.path.NodeEvaluatorCache.stats());
+        } catch (Throwable ignored) {
+            // async pathfinding may be disabled, the pool then was never touched
+        }
+        try {
+            System.out.println("[Leaf] Rail traversal pool: "
+                + org.dreeam.leaf.world.block.OptimizedPoweredRails.trackedPositions() + " tracked positions");
+        } catch (Throwable ignored) {
+            // powered rails were never updated on this server
         }
     }
 

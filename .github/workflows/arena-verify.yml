@@ -190,6 +190,32 @@ jobs:
             scripts/ci/publish-excerpts.sh range "LOADER-$pattern" "$file" 1 400
           done
 
+      - name: Verify the RAM fixes are in the tree
+        if: always()
+        run: |
+          set +e
+          OUT=/tmp/ram.txt
+          {
+            echo "### payload cache (Caffeine)"
+            grep -n "Caffeine\|expireAfterAccess\|maximumWeight" leaf-server/src/main/java/org/dreeam/leaf/perf/offheap/OffHeapChunkPayloadCache.java
+            echo "### node evaluator pool caps"
+            grep -n "maxCachedEvaluators\|maxCachedFeatureSets" leaf-server/src/main/java/org/dreeam/leaf/async/path/NodeEvaluatorCache.java
+            echo "### rail pool (long keys)"
+            grep -n "Long2BooleanOpenHashMap\|maxTrackedPositions\|CHECKED_POS_POOL.clear" leaf-server/src/main/java/org/dreeam/leaf/world/block/OptimizedPoweredRails.java
+            echo "### no leftover object-keyed rail map"
+            grep -rn "Object2BooleanOpenHashMap<BlockPos>" leaf-server/src/main/java || echo "none (good)"
+          } > "$OUT"
+          cat "$OUT"
+          python3 - "$OUT" <<'PYEOF'
+          import sys
+          data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          limit = 3500
+          chunks = [data[i:i + limit] for i in range(0, len(data), limit)] or [""]
+          for index, chunk in enumerate(chunks[:4], start=1):
+              escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+              print(f"::error title=RAMFIX-{index}-OF-{len(chunks)}::{escaped}")
+          PYEOF
+
       - name: Report the test task configuration
         if: always()
         run: |
