@@ -72,6 +72,12 @@ detect_java() {
 JAVA_PATH="$(detect_java)"
 JAVA_BIN="$JAVA_PATH"
 JDK_FEATURE="$(java_feature "$JAVA_PATH")"
+VM_NAME="$("$JAVA_PATH" -XshowSettings:properties -version 2>&1 \
+    | awk -F'= ' '/java.vm.name/ {print $2; exit}' || true)"
+case "$VM_NAME" in
+    *[Gg]raal*) IS_GRAALVM=1 ;;
+    *)          IS_GRAALVM=0 ;;
+esac
 CORES="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 
 total_mem_mb() {
@@ -208,9 +214,26 @@ if [ -r /sys/kernel/mm/transparent_hugepage/enabled ]; then
 fi
 
 # --- JDK version gated extras -------------------------------------------------
+# JEP 519 (JDK 24+): 8 byte object headers instead of 12, 12 instead of 16 for arrays.
+# It is an *experimental* flag until it becomes product, so it needs the unlock flag in
+# the same command line - adding it alone makes the JVM refuse to start ("Unrecognized
+# VM option UseCompactObjectHeaders" / "flag is experimental"). The unlock flag used to
+# be added only in the G1 branch, which is why `--gc zgc` on a modern JDK produced a
+# server that did not boot.
 if [ "$JDK_FEATURE" -ge 24 ]; then
-    # JEP 450: 8 byte object headers - less heap, better cache locality.
+    case " ${FLAGS[*]} " in
+        *" -XX:+UnlockExperimentalVMOptions "*) : ;;
+        *) FLAGS+=("-XX:+UnlockExperimentalVMOptions") ;;
+    esac
     FLAGS+=("-XX:+UseCompactObjectHeaders")
+fi
+if [ "$IS_GRAALVM" = "1" ] && [ "$JDK_FEATURE" -ge 21 ]; then
+    # GraalVM's JIT is the default compiler there; nothing has to be enabled, but telling the
+    # operator that the executable really is GraalVM keeps "why is the profile different"
+    # questions out of the logs.
+    GRAALVM_NOTE="GraalVM detected (${VM_NAME}): JIT is Graal, compact object headers need JDK 24+"
+else
+    GRAALVM_NOTE=""
 fi
 if [ "$JDK_FEATURE" -ge 22 ]; then
     FLAGS+=("--enable-native-access=ALL-UNNAMED")
@@ -225,5 +248,8 @@ if [ "$MODE" = "export" ]; then
 else
     printf '# java: %s (feature %s)\n' "$JAVA_PATH" "$JDK_FEATURE"
     printf '# machine: %s cores, %s MiB RAM -> heap %s, gc %s\n' "$CORES" "$MEM_MB" "$HEAP" "$GC"
+    if [ -n "$GRAALVM_NOTE" ]; then
+        printf '# vm: %s\n' "$GRAALVM_NOTE"
+    fi
     printf '%s\n' "${FLAGS[*]}"
 fi

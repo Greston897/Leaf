@@ -523,6 +523,64 @@ CachedOrNewBitsGetter 2, ActivationList 5, BlockEntityTickersList 3), плюс �
 
 ---
 
+## 11. GraalVM 25 / современные JDK
+
+Ничего не **требуется**: сервер стартует и ведёт себя одинаково на любом JDK 21+. Но новые JVM умеют
+то, что видно только если кто-то это проверит.
+
+### 11.1 Что делает `GraalVmProfile`
+
+На старте печатается одна строка профиля и только те советы, которые реально применимы к этой машине:
+
+```
+[Leaf] GraalVM 25.0.1 / JDK 25 | gc G1 Young Generation,G1 Old Generation | heap max 8192 MiB | cores 8
+[Leaf] Memory advice for this VM (2 item(s)):
+[Leaf]  - compact object headers are off: 8 byte headers instead of 12 typically shrink a Minecraft live set by 10-25 %. JDK/GraalVM 24+: -XX:+UnlockExperimentalVMOptions -XX:+UseCompactObjectHeaders
+[Leaf]  - MaxDirectMemorySize is unlimited; Netty arenas and chunk compression live outside -Xmx ...
+```
+
+Проверяется через `HotSpotDiagnosticMXBean` (есть на любом OpenJDK-производном VM, включая GraalVM):
+`UseCompactObjectHeaders`, `MaxMetaspaceSize`, `MaxDirectMemorySize`, `UseStringDeduplication`, плюс GC
+и лимит heap. Неизвестный флаг/недоступный bean ⇒ просто нет совета, никаких исключений.
+
+**Почему compact object headers — главное здесь.** Heap Minecraft состоит из миллионов мелких объектов
+(`BlockPos`, `BlockState`-узлы, entries, `ItemStack`). Заголовок 12→8 байт и массивов 16→12 снимает
+порядка 10–25 % живого объёма — а вместе с ним и соответствующую долю работы GC. Включается только
+флагом JVM, кодом это не сделать, поэтому Leaf говорит об этом в логе, а не «молча выключает».
+
+### 11.2 Проверка совместимости в CI
+
+Второй прогон тех же тестов идёт на **GraalVM 25 с `-XX:+UseCompactObjectHeaders`** (сама сборка
+остаётся на Temurin 21): если какой-то код форка начнёт зависеть от 12-байтного заголовка или от
+поведения HotSpot — это всплывёт там. Прогон не блокирующий (нет образа GraalVM на раннере ⇒
+пропускается), но результат публикуется аннотацией с версией VM и флагами.
+
+### 11.3 Найденный баг в генераторе флагов
+
+`scripts/leaf-perf/leaf-flags.sh` для JDK 24+ добавлял `-XX:+UseCompactObjectHeaders`, а
+`-XX:+UnlockExperimentalVMOptions` — **только в ветке G1**. То есть `--gc zgc` (или `parallel`) на
+современном JDK выдавал командную строку, с которой сервер **не стартует**. Теперь unlock-флаг
+добавляется в общий блок и проверяется на дубликат, а заодно печатается строка про GraalVM.
+
+---
+
+## 12. Тик-путь: «оптимизация», которая стоила дороже, чем экономила
+
+`LagCompensation.TPSCalculator` — трекер TPS/MSPT для TT20 lag compensation. `tt20()` вызывается из
+`getTickDelay` у `WaterFluid`/`LavaFluid`, то есть **на каждый текущий блок воды/лавы каждый тик**
+(на ферме — сотни тысяч вызовов за тик). И каждый такой вызов делал:
+
+* `getMostAccurateTPS()` → `getAverageTPS()` → обход `synchronizedList<Double>` из 40 элементов
+  **итератором**: аллокация итератора, 40 распаковок `Double`, захват монитора — на один блок-тик;
+* плюс бокс `Long`/`Double` на каждый тик в самом `onTick()`.
+
+Теперь: кольцевой буфер на 40 `double` с поддерживаемой суммой (никаких объектов), среднее — O(1),
+производное значение считается **один раз за тик** в `onTick()`, горячий путь — чтение `volatile`.
+Окно выборки, округление и `min(current, average)` — те же; это закреплено тестами, включая бюджет
+«1 000 000 вызовов `tt20` быстрее 500 мс».
+
+---
+
 ## 9. Быстрый чек-лист
 
 ```bash
