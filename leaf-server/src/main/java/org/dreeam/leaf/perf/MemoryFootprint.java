@@ -84,8 +84,7 @@ public final class MemoryFootprint {
         final long metaspaceCommitted = poolCommitted("Metaspace", MemoryType.NON_HEAP);
         out.append(" | metaspace ").append(mb(metaspaceUsed)).append(" / ").append(mb(metaspaceCommitted));
 
-        final long codeCacheUsed = poolUsed("CodeCache", MemoryType.NON_HEAP);
-        out.append(" | code cache ").append(mb(codeCacheUsed));
+        out.append(" | code cache ").append(mb(codeCacheUsed()));
 
         final long directUsed = bufferPool("direct", false);
         final long directCapacity = bufferPool("direct", true);
@@ -139,6 +138,22 @@ public final class MemoryFootprint {
             return "";
         }
         return directory + ": " + count + " jars, " + mb(bytes) + ' ';
+    }
+
+    /**
+     * @return the bytes used by every {@code CodeHeap} segment (there is no single "CodeCache" pool)
+     */
+    private static long codeCacheUsed() {
+        long used = 0L;
+        for (final MemoryPoolMXBean pool : ManagementFactory.getMemoryPoolMXBeans()) {
+            if (pool.getType() == MemoryType.NON_HEAP && pool.getName().startsWith("CodeHeap")) {
+                final MemoryUsage usage = pool.getUsage();
+                if (usage != null) {
+                    used += usage.getUsed();
+                }
+            }
+        }
+        return used == 0L ? -1L : used;
     }
 
     private static long poolUsed(final String name, final MemoryType type) {

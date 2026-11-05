@@ -91,7 +91,9 @@ jobs:
                         'no intermediate BlockPos per call' \
                         'hoist the loop invariants' \
                         'tick by index instead of allocating an iterator' \
-                        'one array read per lookup'; do
+                        'one array read per lookup' \
+                        'one class loader per identical library set' \
+                        'lazy maven stack'; do
             echo "### marker: $marker"
             grep -rn --include=*.java "$marker" leaf-server .gradle/caches/paperweight/upstreams 2>/dev/null | grep -v '^leaf-server/src/main' | head -5
             echo

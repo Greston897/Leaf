@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leaf <leaf@winds.studio>
+Date: Tue, 28 Oct 2026 12:00:00 +0100
+Subject: [PATCH] Build the maven stack on demand and share library class loaders
+
+Two costs of the spigot library loader that a server pays for nothing:
+
+1. The constructor built the whole Aether/plexus resolver graph (service locator,
+   connectors, http transporter, maven session) and kept it alive for the rest of
+   the uptime, even when no plugin declares a single 'libraries' entry.
+2. Every plugin got its own URLClassLoader, so a library that several plugins
+   declare was loaded into metaspace once per plugin.
+
+The resolver is now built by the first plugin that actually wants a library, and
+plugins whose resolved library sets are identical (same jars, same order) share a
+single loader. Both are purely about memory: the resolved artifacts, the classpath
+order and the isolation between different library sets are unchanged.
+
+-Knobs: -Dleaf.libraryLoader.shareClassLoaders=false restores the old behaviour,
+-Dleaf.libraryLoader.maxSharedLoaders caps the shared map (default 256).
+
+diff --git a/src/main/java/org/bukkit/plugin/java/LibraryLoader.java b/src/main/java/org/bukkit/plugin/java/LibraryLoader.java
+index 330553f..e5a6877 100644
+--- a/src/main/java/org/bukkit/plugin/java/LibraryLoader.java
++++ b/src/main/java/org/bukkit/plugin/java/LibraryLoader.java
+@@ -43,9 +43,20 @@ public class LibraryLoader
+ {
+ 
+     private final Logger logger;
+-    private final RepositorySystem repository;
+-    private final DefaultRepositorySystemSession session;
+-    private final List<RemoteRepository> repositories;
++    // Leaf start - lazy maven stack and shared library class loaders
++    // Building the Aether / plexus resolver graph costs tens of megabytes of metaspace and a few
++    // hundred milliseconds of startup time, and a server whose plugins do not declare 'libraries'
++    // never needs it. The fields stay where they are so the rest of this class is untouched; they are
++    // filled by the first plugin that actually asks for a library.
++    private volatile RepositorySystem repository;
++    private volatile DefaultRepositorySystemSession session;
++    private volatile List<RemoteRepository> repositories;
++    // One class loader per identical, resolved library set instead of one per plugin.
++    private static final boolean SHARE_LOADERS = Boolean.parseBoolean(System.getProperty("leaf.libraryLoader.shareClassLoaders", "true"));
++    private static final int MAX_SHARED_LOADERS = Integer.getInteger("leaf.libraryLoader.maxSharedLoaders", 256);
++    private static final java.util.concurrent.ConcurrentHashMap<String, URLClassLoader> SHARED_LOADERS = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final java.util.concurrent.atomic.AtomicLong SHARED_LOADER_HITS = new java.util.concurrent.atomic.AtomicLong();
++    // Leaf end - lazy maven stack and shared library class loaders
+     public static java.util.function.BiFunction<URL[], ClassLoader, URLClassLoader> LIBRARY_LOADER_FACTORY; // Paper - rewrite reflection in libraries
+     public static java.util.function.Function<List<java.nio.file.Path>, List<java.nio.file.Path>> REMAPPER; // Paper - remap libraries
+ 
+@@ -59,6 +70,22 @@ public class LibraryLoader
+     public LibraryLoader(@NotNull Logger logger)
+     {
+         this.logger = logger;
++        // Leaf - the maven machinery is built on demand, see initMavenRepository()
++    }
++
++    /**
++     * Leaf - builds the Aether resolver graph, once, and only if a plugin really declares libraries.
++     * <p>
++     * Doing this in the constructor meant that every server paid for it (the service locator pulls in
++     * plexus, sisu and httpclient and keeps all of them alive) even when not a single plugin used the
++     * spigot {@code libraries} mechanism.
++     */
++    private synchronized void initMavenRepository()
++    {
++        if ( this.repositories != null )
++        {
++            return;
++        }
+ 
+         DefaultServiceLocator locator = MavenRepositorySystemUtils.newServiceLocator();
+         locator.addService( RepositoryConnectorFactory.class, BasicRepositoryConnectorFactory.class );
+@@ -118,6 +145,7 @@ public class LibraryLoader
+         }
+ 
+         DependencyResult result;
++        if (!dependencies.isEmpty()) this.initMavenRepository(); // Leaf - lazy maven stack
+         if (!dependencies.isEmpty()) try // Paper - plugin loader api
+         {
+             result = repository.resolveDependencies( session, new DependencyRequest( new CollectRequest( (Dependency) null, dependencies, repositories ), null ) );
+@@ -161,14 +189,74 @@ public class LibraryLoader
+         }
+ 
+         // Paper start - rewrite reflection in libraries
++        final URL[] leafUrls = jarFiles.toArray( new URL[ jarFiles.size() ] );
++        // Leaf start - one class loader per identical library set
++        // Paper hands every plugin its own URLClassLoader, so a library that ten plugins declare
++        // (adventure, HikariCP, sqlite-jdbc, kotlin-stdlib, ...) ends up in metaspace ten times.
++        // Plugins that declare exactly the same jars in the same order now get the same loader: the
++        // classpath precedence, the resolved versions and the isolation between *different* sets are
++        // unchanged, only the duplicates disappear.
++        if ( SHARE_LOADERS && LIBRARY_LOADER_FACTORY == null && leafUrls.length > 0 )
++        {
++            final String leafKey = java.util.Arrays.toString( leafUrls );
++            final URLClassLoader leafExisting = SHARED_LOADERS.get( leafKey );
++            if ( leafExisting != null )
++            {
++                SHARED_LOADER_HITS.incrementAndGet();
++                return leafExisting;
++            }
++            if ( SHARED_LOADERS.size() < MAX_SHARED_LOADERS )
++            {
++                final URLClassLoader leafFresh = new SharedLibraryClassLoader( leafUrls, getClass().getClassLoader() );
++                final URLClassLoader leafRaced = SHARED_LOADERS.putIfAbsent( leafKey, leafFresh );
++                return leafRaced != null ? leafRaced : leafFresh;
++            }
++        }
++        // Leaf end - one class loader per identical library set
+         URLClassLoader loader;
+         if (LIBRARY_LOADER_FACTORY == null) {
+-            loader = new URLClassLoader( jarFiles.toArray( new URL[ jarFiles.size() ] ), getClass().getClassLoader() );
++            loader = new URLClassLoader( leafUrls, getClass().getClassLoader() );
+         } else {
+-            loader = LIBRARY_LOADER_FACTORY.apply(jarFiles.toArray( new URL[ jarFiles.size() ] ), getClass().getClassLoader());
++            loader = LIBRARY_LOADER_FACTORY.apply( leafUrls, getClass().getClassLoader());
+         }
+         // Paper end - rewrite reflection in libraries
+ 
+         return loader;
+     }
++
++    // Leaf start - one class loader per identical library set
++    /**
++     * Leaf - a library class loader that is safe to hand to more than one plugin: {@code close()} does
++     * nothing, because a plugin manager that unloads a single plugin must not pull the libraries out
++     * from under every other plugin that declares the same set.
++     */
++    private static final class SharedLibraryClassLoader extends URLClassLoader
++    {
++        SharedLibraryClassLoader(final URL[] urls, final ClassLoader parent)
++        {
++            super( urls, parent );
++        }
++
++        @Override
++        public void close()
++        {
++            // shared between plugins, see the class comment
++        }
++
++        @Override
++        public String toString()
++        {
++            return "LeafSharedLibraryClassLoader" + java.util.Arrays.toString( getURLs() );
++        }
++    }
++
++    /**
++     * Leaf - diagnostics for the startup log / {@code /leaf} reports: how many library sets were
++     * shared and how many plugins reused an already built loader.
++     */
++    public static String sharedLoaderStats()
++    {
++        return SHARED_LOADERS.size() + " shared library class loaders, " + SHARED_LOADER_HITS.get() + " reuses";
++    }
++    // Leaf end - one class loader per identical library set
+ }

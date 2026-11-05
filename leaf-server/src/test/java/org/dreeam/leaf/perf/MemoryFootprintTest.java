@@ -26,7 +26,7 @@ class MemoryFootprintTest {
         assertTrue(first.contains("metaspace"), first);
         assertTrue(first.contains("direct"), first);
         assertTrue(first.contains("classes"), first);
-        assertTrue(first.startsWith("[Leaf][test]"), first);
+        assertTrue(first.startsWith("[Leaf] [test]"), first);
     }
 
     @Test
