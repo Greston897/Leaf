@@ -570,6 +570,24 @@ CachedOrNewBitsGetter 2, ActivationList 5, BlockEntityTickersList 3), плюс �
 совет «поставь GraalVM» им не печатается. Тот же прогон показал, что GraalVM 25 принимает
 `-XX:+UnlockExperimentalVMOptions -XX:+UseCompactObjectHeaders` и весь набор тестов на нём проходит.
 
+Итог подтверждённого прогона (GraalVM Community 25.0.2, JDK 25, `-XX:+UseCompactObjectHeaders`):
+
+```
+[Leaf] GraalVM 25.0.2+10-jvmci-b01 / JDK 25 | gc G1 Young Generation,G1 Concurrent GC,G1 Old Generation | heap max 3996 MiB | cores 4
+[Leaf] Memory advice for this VM (2 item(s)):
+[Leaf]   - MaxDirectMemorySize is unlimited; ...
+[Leaf]   - G1 is in use but UseStringDeduplication is off - ...
+[altvm] tests started 35, succeeded 35, failed 0
+[altvm] exit code: 0
+```
+
+Совета про compact headers нет — на этой VM флаг уже включён, и `GraalVmProfile` это видит. То есть
+код форка не зависит ни от 12-байтного заголовка, ни от деталей HotSpot.
+
+**Практическая оговорка.** Сборка Leaf (`applyPatches` + Gradle 8) на JDK 25 не запускается, поэтому
+GraalVM нельзя ставить в `JAVA_HOME` перед сборкой: Gradle падает за секунду. Собирайте на JDK 21,
+запускайте на GraalVM 25 — именно так и устроен CI (сборка Temurin 21, прогон GraalVM 25).
+
 ### 11.3 Найденный баг в генераторе флагов
 
 `scripts/leaf-perf/leaf-flags.sh` для JDK 24+ добавлял `-XX:+UseCompactObjectHeaders`, а
