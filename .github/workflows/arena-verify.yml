@@ -318,6 +318,131 @@ jobs:
           ./gradlew :leaf-server:leafTestClasspath --init-script /tmp/leaf-tests.init.gradle --no-daemon 2>&1 | tail -5
           ls -la leaf-server/build/leaf-test-classpath.txt
 
+      - name: Prove the fork's assumptions on GraalVM 25 with compact object headers
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          OUT=/tmp/altvm.txt
+          : > "$OUT"
+          CP_FILE=leaf-server/build/leaf-test-classpath.txt
+          {
+            echo "### GraalVM 25 proof (non blocking)"
+            if [ ! -f "$CP_FILE" ]; then
+              echo "[altvm] skipped: no test classpath dump ($CP_FILE)"
+              exit 0
+            fi
+
+            # setup-java's 'graalvm' distribution does not publish a JDK 25 build for every runner
+            # image (it silently produced a Temurin 25 in an earlier attempt), so fetch the real
+            # GraalVM Community archive from its release feed. Any failure here is only a skip.
+            GRAAL_DIR=/tmp/graalvm25
+            JAVA25="$GRAAL_DIR/bin/java"
+            if [ ! -x "$JAVA25" ]; then
+              URL=$(curl -s --max-time 60 "https://api.github.com/repos/graalvm/graalvm-ce-builds/releases?per_page=60" \
+                | python3 -c '
+          import json, sys
+          try:
+              releases = json.load(sys.stdin)
+          except Exception:
+              sys.exit(0)
+          for release in releases:
+              if not release.get("tag_name", "").startswith("jdk-25"):
+                  continue
+              for asset in release.get("assets", []):
+                  name = asset.get("name", "")
+                  if name.startswith("graalvm-community-jdk-25") and name.endswith("_linux-x64_bin.tar.gz"):
+                      print(asset["browser_download_url"])
+                      sys.exit(0)
+          ')
+              if [ -z "$URL" ]; then
+                echo "[altvm] skipped: no GraalVM Community JDK 25 archive advertised by the release feed"
+                exit 0
+              fi
+              echo "[altvm] downloading $URL"
+              mkdir -p "$GRAAL_DIR"
+              if ! curl -sL --max-time 900 "$URL" -o /tmp/graalvm25.tar.gz; then
+                echo "[altvm] skipped: download failed"
+                exit 0
+              fi
+              if ! tar -xzf /tmp/graalvm25.tar.gz -C "$GRAAL_DIR" --strip-components=1; then
+                echo "[altvm] skipped: extraction failed"
+                exit 0
+              fi
+            fi
+            "$JAVA25" -version 2>&1 | head -3
+            if ! "$JAVA25" -version 2>&1 | grep -qi graalvm; then
+              echo "[altvm] skipped: the downloaded JDK does not report itself as GraalVM"
+              exit 0
+            fi
+
+            CP="$(cat "$CP_FILE"):leaf-server/build/classes/java/test:leaf-server/build/resources/test"
+            mkdir -p /tmp/altrun
+            cat > /tmp/altrun/AltVmRunner.java <<'JAVA'
+          import org.junit.platform.launcher.Launcher;
+          import org.junit.platform.launcher.LauncherDiscoveryRequest;
+          import org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder;
+          import org.junit.platform.launcher.core.LauncherFactory;
+          import org.junit.platform.launcher.listeners.SummaryGeneratingListener;
+
+          import static org.junit.platform.engine.discovery.DiscoverySelectors.selectPackage;
+
+          public final class AltVmRunner {
+              public static void main(final String[] args) {
+                  final LauncherDiscoveryRequest request = LauncherDiscoveryRequestBuilder.request()
+                      .selectors(selectPackage("org.dreeam.leaf"))
+                      .build();
+                  final Launcher launcher = LauncherFactory.create();
+                  final SummaryGeneratingListener listener = new SummaryGeneratingListener();
+                  launcher.execute(request, listener);
+                  final var summary = listener.getSummary();
+                  System.out.println("[altvm] vm " + System.getProperty("java.vm.name") + " "
+                      + System.getProperty("java.vm.version") + " / JDK "
+                      + System.getProperty("java.specification.version"));
+                  System.out.println("[altvm] jvm args: "
+                      + java.util.stream.Collectors.joining(" ", java.lang.management.ManagementFactory
+                          .getRuntimeMXBean().getInputArguments()));
+                  System.out.println("[altvm] tests started " + summary.getTestsStartedCount()
+                      + ", succeeded " + summary.getTestsSucceededCount()
+                      + ", failed " + summary.getTestsFailedCount());
+                  summary.getFailures().forEach(failure -> System.out.println("[altvm] FAIL "
+                      + failure.getTestIdentifier().getDisplayName() + ": " + failure.getException()));
+                  System.exit(summary.getTestsFailedCount() == 0L && summary.getTestsStartedCount() > 0L ? 0 : 1);
+              }
+          }
+          JAVA
+            # a 21 class file runs unchanged on 25, and the build JDK is the one on PATH here
+            if ! javac -nowarn -cp "$(cat "$CP_FILE")" -d /tmp/altrun /tmp/altrun/AltVmRunner.java 2>/tmp/altrun/javac.log; then
+              echo "[altvm] skipped: runner did not compile"
+              tail -20 /tmp/altrun/javac.log
+              exit 0
+            fi
+            "$JAVA25" -XX:+UnlockExperimentalVMOptions -XX:+UseCompactObjectHeaders \
+              -cp "/tmp/altrun:$CP" AltVmRunner 2>&1 | grep -v 'unknown enum constant' | tail -60
+            echo "[altvm] exit code: ${PIPESTATUS[0]}"
+          } >> "$OUT" 2>&1
+          cat "$OUT"
+          cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
+          python3 - "$OUT" <<'PYEOF'
+          import sys
+          lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+          chunks, current = [], ""
+          for line in lines:
+              escaped = line.replace("%", "%25").replace("\r", "")
+              candidate = (current + "%0A" + escaped) if current else escaped
+              # GitHub counts the escaped text against the 4096 byte annotation limit.
+              if len(candidate) > 3200:
+                  chunks.append(current)
+                  current = escaped
+              else:
+                  current = candidate
+          if current or not chunks:
+              chunks.append(current)
+          total = len(chunks)
+          for index, chunk in enumerate(chunks[:6], start=1):
+              print(f"::error title=ALT-VM-{index}-OF-{total}::alternative VM proof {index}/{total}%0A{chunk}")
+          PYEOF
+
       - name: Publish the test results as annotations
         if: always()
         run: |
@@ -496,126 +621,3 @@ jobs:
       # GraalVM 25 compatibility proof. Runs last on purpose: installing a second JDK changes
       # JAVA_HOME, and nothing after this point shells out to Gradle.
       # ---------------------------------------------------------------------------------------
-      - name: Prove the fork's assumptions on GraalVM 25 with compact object headers
-        if: always()
-        continue-on-error: true
-        run: |
-          set +e
-          OUT=/tmp/altvm.txt
-          : > "$OUT"
-          CP_FILE=leaf-server/build/leaf-test-classpath.txt
-          {
-            echo "### GraalVM 25 proof (non blocking)"
-            if [ ! -f "$CP_FILE" ]; then
-              echo "[altvm] skipped: no test classpath dump ($CP_FILE)"
-              exit 0
-            fi
-
-            # setup-java's 'graalvm' distribution does not publish a JDK 25 build for every runner
-            # image (it silently produced a Temurin 25 in an earlier attempt), so fetch the real
-            # GraalVM Community archive from its release feed. Any failure here is only a skip.
-            GRAAL_DIR=/tmp/graalvm25
-            JAVA25="$GRAAL_DIR/bin/java"
-            if [ ! -x "$JAVA25" ]; then
-              URL=$(curl -s --max-time 60 "https://api.github.com/repos/graalvm/graalvm-ce-builds/releases?per_page=60" \
-                | python3 -c '
-          import json, sys
-          try:
-              releases = json.load(sys.stdin)
-          except Exception:
-              sys.exit(0)
-          for release in releases:
-              if not release.get("tag_name", "").startswith("jdk-25"):
-                  continue
-              for asset in release.get("assets", []):
-                  name = asset.get("name", "")
-                  if name.startswith("graalvm-community-jdk-25") and name.endswith("_linux-x64_bin.tar.gz"):
-                      print(asset["browser_download_url"])
-                      sys.exit(0)
-          ')
-              if [ -z "$URL" ]; then
-                echo "[altvm] skipped: no GraalVM Community JDK 25 archive advertised by the release feed"
-                exit 0
-              fi
-              echo "[altvm] downloading $URL"
-              mkdir -p "$GRAAL_DIR"
-              if ! curl -sL --max-time 900 "$URL" -o /tmp/graalvm25.tar.gz; then
-                echo "[altvm] skipped: download failed"
-                exit 0
-              fi
-              if ! tar -xzf /tmp/graalvm25.tar.gz -C "$GRAAL_DIR" --strip-components=1; then
-                echo "[altvm] skipped: extraction failed"
-                exit 0
-              fi
-            fi
-            "$JAVA25" -version 2>&1 | head -3
-            if ! "$JAVA25" -version 2>&1 | grep -qi graalvm; then
-              echo "[altvm] skipped: the downloaded JDK does not report itself as GraalVM"
-              exit 0
-            fi
-
-            CP="$(cat "$CP_FILE"):leaf-server/build/classes/java/test:leaf-server/build/resources/test"
-            mkdir -p /tmp/altrun
-            cat > /tmp/altrun/AltVmRunner.java <<'JAVA'
-          import org.junit.platform.launcher.Launcher;
-          import org.junit.platform.launcher.LauncherDiscoveryRequest;
-          import org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder;
-          import org.junit.platform.launcher.core.LauncherFactory;
-          import org.junit.platform.launcher.listeners.SummaryGeneratingListener;
-
-          import static org.junit.platform.engine.discovery.DiscoverySelectors.selectPackage;
-
-          public final class AltVmRunner {
-              public static void main(final String[] args) {
-                  final LauncherDiscoveryRequest request = LauncherDiscoveryRequestBuilder.request()
-                      .selectors(selectPackage("org.dreeam.leaf"))
-                      .build();
-                  final Launcher launcher = LauncherFactory.create();
-                  final SummaryGeneratingListener listener = new SummaryGeneratingListener();
-                  launcher.execute(request, listener);
-                  final var summary = listener.getSummary();
-                  System.out.println("[altvm] vm " + System.getProperty("java.vm.name") + " "
-                      + System.getProperty("java.vm.version") + " / JDK "
-                      + System.getProperty("java.specification.version"));
-                  System.out.println("[altvm] jvm args: "
-                      + java.util.stream.Collectors.joining(" ", java.lang.management.ManagementFactory
-                          .getRuntimeMXBean().getInputArguments()));
-                  System.out.println("[altvm] tests started " + summary.getTestsStartedCount()
-                      + ", succeeded " + summary.getTestsSucceededCount()
-                      + ", failed " + summary.getTestsFailedCount());
-                  summary.getFailures().forEach(failure -> System.out.println("[altvm] FAIL "
-                      + failure.getTestIdentifier().getDisplayName() + ": " + failure.getException()));
-                  System.exit(summary.getTestsFailedCount() == 0L && summary.getTestsStartedCount() > 0L ? 0 : 1);
-              }
-          }
-          JAVA
-            # a 21 class file runs unchanged on 25, and the build JDK is the one on PATH here
-            if ! javac -nowarn -cp "$(cat "$CP_FILE")" -d /tmp/altrun /tmp/altrun/AltVmRunner.java 2>/tmp/altrun/javac.log; then
-              echo "[altvm] skipped: runner did not compile"
-              tail -20 /tmp/altrun/javac.log
-              exit 0
-            fi
-            "$JAVA25" -XX:+UnlockExperimentalVMOptions -XX:+UseCompactObjectHeaders \
-              -cp "/tmp/altrun:$CP" AltVmRunner 2>&1 | grep -v 'unknown enum constant' | tail -60
-            echo "[altvm] exit code: ${PIPESTATUS[0]}"
-          } >> "$OUT" 2>&1
-          cat "$OUT"
-          python3 - "$OUT" <<'PYEOF'
-          import sys
-          lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
-          chunks, current = [], ""
-          for line in lines:
-              escaped = line.replace("%", "%25").replace("\r", "")
-              candidate = (current + "%0A" + escaped) if current else escaped
-              # GitHub counts the escaped text against the 4096 byte annotation limit.
-              if len(candidate) > 3200:
-                  chunks.append(current)
-                  current = escaped
-              else:
-                  current = candidate
-          if current or not chunks:
-              chunks.append(current)
-          total = len(chunks)
-          for index, chunk in enumerate(chunks[:6], start=1):
-              print(f"::error title=ALT-VM-{index}-OF-{total}::alternative VM proof {index}/{total}%0A{chunk}")
-          PYEOF
