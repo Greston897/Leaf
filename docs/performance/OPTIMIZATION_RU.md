@@ -550,10 +550,25 @@ CachedOrNewBitsGetter 2, ActivationList 5, BlockEntityTickersList 3), плюс �
 
 ### 11.2 Проверка совместимости в CI
 
-Второй прогон тех же тестов идёт на **GraalVM 25 с `-XX:+UseCompactObjectHeaders`** (сама сборка
-остаётся на Temurin 21): если какой-то код форка начнёт зависеть от 12-байтного заголовка или от
+Второй прогон тех же тестов идёт на **GraalVM Community 25 с `-XX:+UseCompactObjectHeaders`** (сама
+сборка остаётся на Temurin 21): если какой-то код форка начнёт зависеть от 12-байтного заголовка или от
 поведения HotSpot — это всплывёт там. Прогон не блокирующий (нет образа GraalVM на раннере ⇒
 пропускается), но результат публикуется аннотацией с версией VM и флагами.
+
+И он сразу нашёл настоящий баг. В логе первого настоящего прогона на GraalVM CE 25.0.2 было:
+
+```
+[Leaf] JVM 25.0.2+10-jvmci-b01 / JDK 25 | gc ... 
+[Leaf]   - not running on GraalVM: its JIT compiles the tick loop ...
+```
+
+То есть Leaf сообщал «вы не на GraalVM» **на GraalVM**. Причина: GraalVM Community по-прежнему
+представляется как `java.vm.name = "OpenJDK 64-Bit Server VM"`, а «GraalVM Community» написано только в
+`java.vm.vendor` / `java.vendor`. Детект теперь смотрит на семь identity-свойств (`java.vm.name`,
+`java.vm.vendor`, `java.vendor`, `java.vendor.version`, `java.runtime.*`, `java.vm.version`), а сборки с
+тегом `-jvmci-` (в том числе GraalVM, и «просто OpenJDK с JVMCI») помечаются отдельно как `JVM (JVMCI)` —
+совет «поставь GraalVM» им не печатается. Тот же прогон показал, что GraalVM 25 принимает
+`-XX:+UnlockExperimentalVMOptions -XX:+UseCompactObjectHeaders` и весь набор тестов на нём проходит.
 
 ### 11.3 Найденный баг в генераторе флагов
 

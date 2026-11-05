@@ -41,10 +41,37 @@ public final class GraalVmProfile {
     }
 
     /**
-     * @return {@code true} when running on a GraalVM build (GraalVM CE, GraalVM for JDK x, Mandrel, ...)
+     * System properties that identify the VM. {@code java.vm.name} alone is <b>not</b> enough: GraalVM
+     * Community 25 still reports {@code java.vm.name = "OpenJDK 64-Bit Server VM"} and only says
+     * "GraalVM Community" in {@code java.vm.vendor}/{@code java.vendor}. Checking the name first made
+     * this class print "not running on GraalVM" on a real GraalVM - the alternative VM job in CI caught
+     * it, which is exactly why that job exists.
+     */
+    private static final String[] VM_IDENTITY_PROPERTIES = {
+        "java.vm.name", "java.vm.vendor", "java.vm.version", "java.vendor", "java.vendor.version",
+        "java.runtime.name", "java.runtime.version",
+    };
+
+    /**
+     * @return {@code true} when running on a GraalVM build (GraalVM Community, GraalVM for JDK x,
+     * Oracle GraalVM, Mandrel, ...)
      */
     public static boolean isGraalVm() {
-        return vmName().toLowerCase(java.util.Locale.ROOT).contains("graalvm");
+        for (final String property : VM_IDENTITY_PROPERTIES) {
+            if (System.getProperty(property, "").toLowerCase(java.util.Locale.ROOT).contains("graalvm")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @return {@code true} for a build that carries the JVMCI compiler interface (a stock OpenJDK
+     * compiled with JVMCI, or any GraalVM). Such a build is not a GraalVM, but it shares the newer
+     * compiler plumbing, so the "you could run GraalVM" note is pointless there.
+     */
+    public static boolean isJvmciBuild() {
+        return System.getProperty("java.vm.version", "").toLowerCase(java.util.Locale.ROOT).contains("-jvmci-");
     }
 
     public static String vmName() {
@@ -61,7 +88,8 @@ public final class GraalVmProfile {
     public static void printProfile() {
         try {
             final StringBuilder out = new StringBuilder(256);
-            out.append(PREFIX).append(isGraalVm() ? "GraalVM" : "JVM").append(' ').append(vmVersion())
+            out.append(PREFIX).append(isGraalVm() ? "GraalVM" : isJvmciBuild() ? "JVM (JVMCI)" : "JVM")
+                .append(' ').append(vmVersion())
                 .append(" | gc ").append(garbageCollectors())
                 .append(" | heap max ").append(Runtime.getRuntime().maxMemory() / (1024L * 1024L)).append(" MiB")
                 .append(" | cores ").append(Runtime.getRuntime().availableProcessors());
@@ -106,7 +134,7 @@ public final class GraalVmProfile {
                 + " many identical strings that cost nothing to deduplicate");
         }
 
-        if (!isGraalVm() && Runtime.getRuntime().availableProcessors() >= 4) {
+        if (!isGraalVm() && !isJvmciBuild() && Runtime.getRuntime().availableProcessors() >= 4) {
             advice.add("not running on GraalVM: its JIT compiles the tick loop with better inlining and"
                 + " its JDK 25 builds can use compact object headers; the server does not require it");
         }
