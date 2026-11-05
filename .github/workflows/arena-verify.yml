@@ -27,11 +27,35 @@ jobs:
           fetch-depth: 0
 
       - name: Setup java
+        id: jdk21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
           cache: gradle
+
+      - name: Setup GraalVM 25 for the compatibility test run
+        id: graalvm
+        # Non blocking: if this image is not available for the runner, the rest of the job (which is
+        # the part that gates a release) must still pass. The GraalVM run is a proof, not a gate.
+        continue-on-error: true
+        uses: actions/setup-java@v4
+        with:
+          distribution: graalvm
+          java-version: '25'
+          cache: gradle
+
+      - name: Restore the build JDK and keep the GraalVM path
+        run: |
+          echo "LEAF_ALT_JAVA=${{ steps.graalvm.outputs.java-home }}/bin/java" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=${{ steps.jdk21.outputs.java-home }}" >> "$GITHUB_ENV"
+          echo "alt java: ${{ steps.graalvm.outputs.java-home }}/bin/java"
+          if [ -x "${{ steps.graalvm.outputs.java-home }}/bin/java" ]; then
+            "${{ steps.graalvm.outputs.java-home }}/bin/java" -version 2>&1 | head -3
+          else
+            echo "GraalVM 25 is not available on this runner - the alt run will be skipped"
+            echo "LEAF_ALT_JAVA=" >> "$GITHUB_ENV"
+          fi
 
       - name: Configure git
         run: |
@@ -268,6 +292,32 @@ jobs:
                       exceptionFormat 'full'
                   }
               }
+
+              // Same classes, same classpath, but on the alternative VM (GraalVM 25) with the memory
+              // feature this server is supposed to benefit from: compact object headers. If anything
+              // in the fork assumes a 12 byte object header, this run is where it shows up.
+              def altJava = System.getenv('LEAF_ALT_JAVA')
+              if (altJava != null && !altJava.isBlank() && new File(altJava).canExecute()) {
+                  project.tasks.register('leafUnitTestAltVm', org.gradle.api.tasks.testing.Test) { task ->
+                      task.description = 'Runs the Leaf unit tests on the alternative VM (GraalVM 25, compact object headers)'
+                      task.group = 'verification'
+                      task.testClassesDirs = project.sourceSets.test.output.classesDirs
+                      task.classpath = project.sourceSets.test.runtimeClasspath
+                      task.executable = altJava
+                      task.jvmArgs('-XX:+UnlockExperimentalVMOptions', '-XX:+UseCompactObjectHeaders', '-Dleaf.memoryReport=true')
+                      task.useJUnitPlatform()
+                      task.filter {
+                          includeTestsMatching('org.dreeam.leaf.*')
+                          setFailOnNoMatchingTests(true)
+                      }
+                      task.testLogging {
+                          events 'failed'
+                          exceptionFormat 'full'
+                      }
+                  }
+              } else {
+                  println '[Leaf CI] alternative VM run skipped: LEAF_ALT_JAVA is not set'
+              }
           }
           EOF
 
@@ -275,6 +325,54 @@ jobs:
         run: |
           set -o pipefail
           ./gradlew :leaf-server:leafUnitTest --init-script /tmp/leaf-tests.init.gradle --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-test.log
+
+      - name: Run the Leaf unit tests on GraalVM 25 (compact object headers)
+        if: always()
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          if [ -z "${LEAF_ALT_JAVA:-}" ] || [ ! -x "$LEAF_ALT_JAVA" ]; then
+            echo "no alternative VM available, skipping"
+            exit 0
+          fi
+          "$LEAF_ALT_JAVA" -XX:+UnlockExperimentalVMOptions -XX:+UseCompactObjectHeaders -version 2>&1 | head -3
+          ./gradlew :leaf-server:leafUnitTestAltVm --init-script /tmp/leaf-tests.init.gradle --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-test-alt.log
+
+      - name: Publish the GraalVM 25 test results as annotations
+        if: always()
+        run: |
+          set +e
+          OUT=/tmp/altvm.txt
+          {
+            echo "### alternative VM run"
+            if [ -f /tmp/gradle-test-alt.log ]; then
+              grep -E "BUILD |tests completed|Leaf CI|Gradle Test Executor|vm.name|-XX:" /tmp/gradle-test-alt.log | head -20
+              echo "### alt vm junit results"
+              ls leaf-server/build/test-results/leafUnitTestAltVm 2>/dev/null | head -10
+              python3 - <<'PYEOF'
+          import glob
+          import xml.etree.ElementTree as ET
+          total = failed = 0
+          for path in sorted(glob.glob("leaf-server/build/test-results/leafUnitTestAltVm/*.xml")):
+              root = ET.parse(path).getroot()
+              total += int(root.get("tests", 0))
+              failed += int(root.get("failures", 0)) + int(root.get("errors", 0))
+          print(f"### alt vm total: {total} tests, {failed} failed")
+          PYEOF
+            else
+              echo "the alternative VM run did not start"
+            fi
+          } > "$OUT"
+          cat "$OUT"
+          python3 - "$OUT" <<'PYEOF'
+          import sys
+          data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          limit = 3500
+          chunks = [data[i:i + limit] for i in range(0, len(data), limit)] or [""]
+          for index, chunk in enumerate(chunks[:4], start=1):
+              escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+              print(f"::error title=ALT-VM-{index}-OF-{len(chunks)}::{escaped}")
+          PYEOF
 
       - name: Publish the test results as annotations
         if: always()

@@ -1,10 +1,5 @@
 package org.dreeam.leaf.misc;
 
-import it.unimi.dsi.fastutil.doubles.DoubleArrayList;
-
-import java.util.Collections;
-import java.util.List;
-
 public class LagCompensation {
 
     public static float tt20(float ticks, boolean limitZero) {
@@ -32,13 +27,48 @@ public class LagCompensation {
         return ticks == 0 ? 0 : ticks * TPSCalculator.getMostAccurateTPS() / TPSCalculator.MAX_TPS;
     }
 
+    /**
+     * Leaf - TPS/MSPT tracker used by the TT20 lag compensation.
+     * <p>
+     * <b>Why this was rewritten.</b> {@link #rawTT20} is called from {@code getTickDelay} of the fluid
+     * classes, i.e. once per flowing water/lava block per tick - in a farm that is hundreds of
+     * thousands of calls per tick. Every one of them went through
+     * {@code getMostAccurateTPS() -> getAverageTPS()}, which walked a 40 element
+     * {@code synchronizedList<Double>} with an iterator: an iterator allocation, 40 {@code Double}
+     * unboxings and a monitor acquisition <b>per block tick</b>. That is the archetype of a
+     * "optimisation" that costs more than it saves.
+     * <p>
+     * Now the average is maintained incrementally (running sum, fixed ring buffer, no boxing) and the
+     * derived TPS is computed once per tick in {@link #onTick()} instead of once per caller. The
+     * observable values are identical: the same 40 sample window, the same rounded average, the same
+     * {@code min(current, average)}.
+     * <p>
+     * Concurrency: {@link #onTick()} runs on the server thread and is the only writer; readers on other
+     * threads see the values published by the previous tick (volatile fields). That matches the old
+     * behaviour, where a reader could also observe a partially updated history.
+     */
     public static class TPSCalculator {
 
+        // Kept for source compatibility with anything that referenced them; the primitives below are
+        // what the code actually uses.
+        @Deprecated
         public static Long lastTick;
+        @Deprecated
         public static Long currentTick;
-        private static double allMissedTicks = 0;
-        private static final List<Double> tpsHistory = Collections.synchronizedList(new DoubleArrayList());
-        private static final int historyLimit = 40;
+
+        private static final int HISTORY_LIMIT = 40;
+        /** milliseconds of the current and the previous tick, -1 while unknown */
+        private static volatile long currentMillis = -1L;
+        private static volatile long previousMillis = -1L;
+
+        private static final double[] history = new double[HISTORY_LIMIT];
+        private static volatile int historySize;
+        private static int historyNext;
+        private static double historySum;
+        /** {@code min(getTPS(), getAverageTPS())}, refreshed once per tick */
+        private static volatile double mostAccurateTps = -1.0D;
+
+        private static volatile double allMissedTicks = 0.0D;
 
         public static final int MAX_TPS = 20;
         public static final int FULL_TICK = 50;
@@ -47,62 +77,96 @@ public class LagCompensation {
         }
 
         public static void onTick() {
-            if (currentTick != null) {
-                lastTick = currentTick;
+            final long now = System.currentTimeMillis();
+            if (currentMillis >= 0L) {
+                previousMillis = currentMillis;
+                // compatibility fields, only written once per tick
+                lastTick = previousMillis;
             }
+            currentMillis = now;
+            currentTick = now;
 
-            currentTick = System.currentTimeMillis();
-
-            addToHistory(getTPS());
+            addToHistory(currentTps());
             clearMissedTicks();
             missedTick();
+            // Everything above is what readers used to recompute per call; do it once.
+            mostAccurateTps = Math.min(currentTps(), averageTps());
         }
 
-        private static void addToHistory(double tps) {
-            if (tpsHistory.size() >= historyLimit) {
-                tpsHistory.removeFirst();
+        private static void addToHistory(final double tps) {
+            synchronized (history) {
+                if (historySize == HISTORY_LIMIT) {
+                    // overwrite the oldest sample and take it off the running sum
+                    historySum -= history[historyNext];
+                } else {
+                    historySize++;
+                }
+                history[historyNext] = tps;
+                historySum += tps;
+                historyNext = (historyNext + 1) % HISTORY_LIMIT;
             }
-
-            tpsHistory.add(tps);
         }
 
         public static long getMSPT() {
-            return currentTick - lastTick;
+            final long current = currentMillis;
+            final long previous = previousMillis;
+            if (current < 0L || previous < 0L) {
+                return 0L;
+            }
+            return current - previous;
         }
 
         public static double getAverageTPS() {
-            double sum = 0.0;
+            return averageTps();
+        }
 
-            for (double value : tpsHistory) {
-                sum += value;
+        private static double averageTps() {
+            synchronized (history) {
+                if (historySize == 0) {
+                    return 0.1D;
+                }
+                return historySum / historySize;
             }
-
-            return tpsHistory.isEmpty() ? 0.1 : sum / tpsHistory.size();
         }
 
         public static double getTPS() {
-            if (lastTick == null) return -1;
-            if (getMSPT() <= 0) return 0.1;
+            return currentTps();
+        }
 
-            double tps = 1000 / (double) getMSPT();
-
-            return tps > MAX_TPS ? MAX_TPS : tps;
+        private static double currentTps() {
+            if (previousMillis < 0L) {
+                return -1.0D;
+            }
+            final long mspt = currentMillis - previousMillis;
+            if (mspt <= 0L) {
+                return 0.1D;
+            }
+            final double tps = 1000.0D / (double) mspt;
+            return Math.min(tps, (double) MAX_TPS);
         }
 
         public static void missedTick() {
-            if (lastTick == null) return;
-
-            long mspt = getMSPT() <= 0 ? 50 : getMSPT();
-            double missedTicks = (mspt / (double) FULL_TICK) - 1;
-
-            allMissedTicks += missedTicks <= 0 ? 0 : missedTicks;
+            if (previousMillis < 0L) {
+                return;
+            }
+            final long mspt = getMSPT() <= 0L ? (long) FULL_TICK : getMSPT();
+            final double missedTicks = (mspt / (double) FULL_TICK) - 1.0D;
+            allMissedTicks += missedTicks <= 0.0D ? 0.0D : missedTicks;
         }
 
+        /**
+         * @return {@code min(current TPS, average TPS)} as of the last {@link #onTick()} - O(1), the
+         * value the hot {@code tt20} path needs
+         */
         public static double getMostAccurateTPS() {
-            return Math.min(getTPS(), getAverageTPS());
+            final double cached = mostAccurateTps;
+            if (cached >= 0.0D) {
+                return cached;
+            }
+            return Math.min(currentTps(), averageTps());
         }
 
-        public double getAllMissedTicks() {
+        public static double getAllMissedTicks() {
             return allMissedTicks;
         }
 
@@ -115,7 +179,7 @@ public class LagCompensation {
         }
 
         public void resetMissedTicks() {
-            allMissedTicks = 0;
+            allMissedTicks = 0.0D;
         }
     }
 }

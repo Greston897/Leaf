@@ -22,6 +22,9 @@ public class LeafBootstrap {
         // Boot and shutdown snapshot of heap / metaspace / direct memory / RSS and of the jar
         // directories, so "where did the 2 GB go" is answered with numbers.
         MemoryFootprint.install();
+        // What this VM is, and what it is leaving on the table (compact object headers, metaspace and
+        // direct memory ceilings, string deduplication). Advice only - nothing here changes behaviour.
+        org.dreeam.leaf.perf.GraalVmProfile.printProfile();
         reportLeafCaches();
         // Only does something when -Dleaf.offHeap.chunkCacheMB is set.
         org.dreeam.leaf.perf.offheap.OffHeapChunkPayloadCache.installShutdownReport();
