@@ -34,29 +34,6 @@ jobs:
           java-version: '21'
           cache: gradle
 
-      - name: Setup GraalVM 25 for the compatibility test run
-        id: graalvm
-        # Non blocking: if this image is not available for the runner, the rest of the job (which is
-        # the part that gates a release) must still pass. The GraalVM run is a proof, not a gate.
-        continue-on-error: true
-        uses: actions/setup-java@v4
-        with:
-          distribution: graalvm
-          java-version: '25'
-          cache: gradle
-
-      - name: Restore the build JDK and keep the GraalVM path
-        run: |
-          echo "LEAF_ALT_JAVA=${{ steps.graalvm.outputs.java-home }}/bin/java" >> "$GITHUB_ENV"
-          echo "JAVA_HOME=${{ steps.jdk21.outputs.java-home }}" >> "$GITHUB_ENV"
-          echo "alt java: ${{ steps.graalvm.outputs.java-home }}/bin/java"
-          if [ -x "${{ steps.graalvm.outputs.java-home }}/bin/java" ]; then
-            "${{ steps.graalvm.outputs.java-home }}/bin/java" -version 2>&1 | head -3
-          else
-            echo "GraalVM 25 is not available on this runner - the alt run will be skipped"
-            echo "LEAF_ALT_JAVA=" >> "$GITHUB_ENV"
-          fi
-
       - name: Configure git
         run: |
           git config --global user.email "no-reply@github.com"
@@ -293,30 +270,17 @@ jobs:
                   }
               }
 
-              // Same classes, same classpath, but on the alternative VM (GraalVM 25) with the memory
-              // feature this server is supposed to benefit from: compact object headers. If anything
-              // in the fork assumes a 12 byte object header, this run is where it shows up.
-              def altJava = System.getenv('LEAF_ALT_JAVA')
-              if (altJava != null && !altJava.isBlank() && new File(altJava).canExecute()) {
-                  project.tasks.register('leafUnitTestAltVm', org.gradle.api.tasks.testing.Test) { task ->
-                      task.description = 'Runs the Leaf unit tests on the alternative VM (GraalVM 25, compact object headers)'
-                      task.group = 'verification'
-                      task.testClassesDirs = project.sourceSets.test.output.classesDirs
-                      task.classpath = project.sourceSets.test.runtimeClasspath
-                      task.executable = altJava
-                      task.jvmArgs('-XX:+UnlockExperimentalVMOptions', '-XX:+UseCompactObjectHeaders', '-Dleaf.memoryReport=true')
-                      task.useJUnitPlatform()
-                      task.filter {
-                          includeTestsMatching('org.dreeam.leaf.*')
-                          setFailOnNoMatchingTests(true)
-                      }
-                      task.testLogging {
-                          events 'failed'
-                          exceptionFormat 'full'
-                      }
+              // Dumps the test runtime classpath, so the alternative VM run can be started with a
+              // plain 'java' instead of Gradle (Gradle 8 does not support JDK 25 as its launcher).
+              project.tasks.register('leafTestClasspath') { task ->
+                  task.description = 'Writes the leaf-server test runtime classpath to build/leaf-test-classpath.txt'
+                  task.group = 'verification'
+                  task.doLast {
+                      def out = project.layout.buildDirectory.file('leaf-test-classpath.txt').get().asFile
+                      out.parentFile.mkdirs()
+                      out.text = project.sourceSets.test.runtimeClasspath.asPath
+                      println "[Leaf CI] test classpath written to ${out} (${out.text.length()} chars)"
                   }
-              } else {
-                  println '[Leaf CI] alternative VM run skipped: LEAF_ALT_JAVA is not set'
               }
           }
           EOF
@@ -326,53 +290,12 @@ jobs:
           set -o pipefail
           ./gradlew :leaf-server:leafUnitTest --init-script /tmp/leaf-tests.init.gradle --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-test.log
 
-      - name: Run the Leaf unit tests on GraalVM 25 (compact object headers)
-        if: always()
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          if [ -z "${LEAF_ALT_JAVA:-}" ] || [ ! -x "$LEAF_ALT_JAVA" ]; then
-            echo "no alternative VM available, skipping"
-            exit 0
-          fi
-          "$LEAF_ALT_JAVA" -XX:+UnlockExperimentalVMOptions -XX:+UseCompactObjectHeaders -version 2>&1 | head -3
-          ./gradlew :leaf-server:leafUnitTestAltVm --init-script /tmp/leaf-tests.init.gradle --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-test-alt.log
-
-      - name: Publish the GraalVM 25 test results as annotations
+      - name: Dump the test runtime classpath for the alternative VM run
         if: always()
         run: |
           set +e
-          OUT=/tmp/altvm.txt
-          {
-            echo "### alternative VM run"
-            if [ -f /tmp/gradle-test-alt.log ]; then
-              grep -E "BUILD |tests completed|Leaf CI|Gradle Test Executor|vm.name|-XX:" /tmp/gradle-test-alt.log | head -20
-              echo "### alt vm junit results"
-              ls leaf-server/build/test-results/leafUnitTestAltVm 2>/dev/null | head -10
-              python3 - <<'PYEOF'
-          import glob
-          import xml.etree.ElementTree as ET
-          total = failed = 0
-          for path in sorted(glob.glob("leaf-server/build/test-results/leafUnitTestAltVm/*.xml")):
-              root = ET.parse(path).getroot()
-              total += int(root.get("tests", 0))
-              failed += int(root.get("failures", 0)) + int(root.get("errors", 0))
-          print(f"### alt vm total: {total} tests, {failed} failed")
-          PYEOF
-            else
-              echo "the alternative VM run did not start"
-            fi
-          } > "$OUT"
-          cat "$OUT"
-          python3 - "$OUT" <<'PYEOF'
-          import sys
-          data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-          limit = 3500
-          chunks = [data[i:i + limit] for i in range(0, len(data), limit)] or [""]
-          for index, chunk in enumerate(chunks[:4], start=1):
-              escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
-              print(f"::error title=ALT-VM-{index}-OF-{len(chunks)}::{escaped}")
-          PYEOF
+          ./gradlew :leaf-server:leafTestClasspath --init-script /tmp/leaf-tests.init.gradle --no-daemon 2>&1 | tail -5
+          ls -la leaf-server/build/leaf-test-classpath.txt
 
       - name: Publish the test results as annotations
         if: always()
@@ -547,3 +470,89 @@ jobs:
               print(f"::error title={name}-{index}-OF-{len(chunks)}::{escaped}")
           PYEOF
           done
+
+      # ---------------------------------------------------------------------------------------
+      # GraalVM 25 compatibility proof. Runs last on purpose: installing a second JDK changes
+      # JAVA_HOME, and nothing after this point shells out to Gradle.
+      # ---------------------------------------------------------------------------------------
+      - name: Setup GraalVM 25
+        id: graalvm
+        continue-on-error: true
+        uses: actions/setup-java@v4
+        with:
+          distribution: graalvm
+          java-version: '25'
+
+      - name: Run the Leaf tests on GraalVM 25 with compact object headers
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          OUT=/tmp/altvm.txt
+          : > "$OUT"
+          GRAAL_BIN="${{ steps.graalvm.outputs.java-home }}/bin/java"
+          GRAAL_JAVAC="${{ steps.graalvm.outputs.java-home }}/bin/javac"
+          {
+            echo "### alternative VM"
+            echo "graal: $GRAAL_BIN"
+            CP_FILE=leaf-server/build/leaf-test-classpath.txt
+            if [ ! -x "$GRAAL_BIN" ]; then
+              echo "GraalVM 25 is not available on this runner - skipping"
+              exit 0
+            fi
+            if [ ! -f "$CP_FILE" ]; then
+              echo "no test classpath dump - skipping"
+              exit 0
+            fi
+            "$GRAAL_BIN" -version 2>&1 | head -2
+            CP="$(cat "$CP_FILE"):leaf-server/build/classes/java/test"
+            mkdir -p /tmp/altrun
+            cat > /tmp/altrun/AltVmRunner.java <<'JAVA'
+          import org.junit.platform.launcher.Launcher;
+          import org.junit.platform.launcher.LauncherDiscoveryRequest;
+          import org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder;
+          import org.junit.platform.launcher.core.LauncherFactory;
+          import org.junit.platform.launcher.listeners.SummaryGeneratingListener;
+
+          import static org.junit.platform.engine.discovery.DiscoverySelectors.selectPackage;
+
+          public final class AltVmRunner {
+              public static void main(final String[] args) {
+                  final LauncherDiscoveryRequest request = LauncherDiscoveryRequestBuilder.request()
+                      .selectors(selectPackage("org.dreeam.leaf"))
+                      .build();
+                  final Launcher launcher = LauncherFactory.create();
+                  final SummaryGeneratingListener listener = new SummaryGeneratingListener();
+                  launcher.execute(request, listener);
+                  final var summary = listener.getSummary();
+                  System.out.println("[altvm] vm " + System.getProperty("java.vm.name") + " / JDK "
+                      + System.getProperty("java.specification.version"));
+                  System.out.println("[altvm] tests started " + summary.getTestsStartedCount()
+                      + ", succeeded " + summary.getTestsSucceededCount()
+                      + ", failed " + summary.getTestsFailedCount());
+                  summary.getFailures().forEach(failure -> System.out.println("[altvm] FAIL "
+                      + failure.getTestIdentifier().getDisplayName() + ": " + failure.getException()));
+                  System.exit(summary.getTestsFailedCount() == 0L && summary.getTestsStartedCount() > 0L ? 0 : 1);
+              }
+          }
+          JAVA
+            # compile the runner with the build JDK (a 21 class file runs fine on 25)
+            "$GRAAL_JAVAC" -version >/dev/null 2>&1 && JAVAC="$GRAAL_JAVAC" || JAVAC="javac"
+            if ! "$JAVAC" -cp "$(cat "$CP_FILE")" -d /tmp/altrun /tmp/altrun/AltVmRunner.java; then
+              echo "could not compile the runner with $JAVAC - skipping"
+              exit 0
+            fi
+            "$GRAAL_BIN" -XX:+UnlockExperimentalVMOptions -XX:+UseCompactObjectHeaders \
+              -cp "/tmp/altrun:$CP" AltVmRunner
+            echo "### exit code: $?"
+          } >> "$OUT" 2>&1
+          cat "$OUT"
+          python3 - "$OUT" <<'PYEOF'
+          import sys
+          data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          limit = 3500
+          chunks = [data[i:i + limit] for i in range(0, len(data), limit)] or [""]
+          for index, chunk in enumerate(chunks[:4], start=1):
+              escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+              print(f"::error title=ALT-VM-{index}-OF-{len(chunks)}::{escaped}")
+          PYEOF
