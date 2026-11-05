@@ -325,26 +325,36 @@ jobs:
           set +e
           OUT=/tmp/altvm.txt
           : > "$OUT"
-          CP_FILE=leaf-server/build/leaf-test-classpath.txt
-          {
-            echo "### GraalVM 25 proof (non blocking)"
+
+          # Everything happens inside a function: 'exit' in a shell group would leave the script before
+          # the report below is published, which is exactly how the previous attempt lost its output.
+          probe() {
+            CP_FILE=leaf-server/build/leaf-test-classpath.txt
             if [ ! -f "$CP_FILE" ]; then
               echo "[altvm] skipped: no test classpath dump ($CP_FILE)"
-              exit 0
+              return 0
             fi
 
             # setup-java's 'graalvm' distribution does not publish a JDK 25 build for every runner
             # image (it silently produced a Temurin 25 in an earlier attempt), so fetch the real
-            # GraalVM Community archive from its release feed. Any failure here is only a skip.
-            GRAAL_DIR=/tmp/graalvm25
-            JAVA25="$GRAAL_DIR/bin/java"
+            # GraalVM Community archive from its release feed.
+            JAVA25=/tmp/graalvm25/bin/java
+            if [ ! -x "$JAVA25" ]; then
+              # the runner image ships a GraalVM toolcache on some labels - prefer it, it is free
+              CACHED=$(ls -d /opt/hostedtoolcache/Java_GraalVM/*/x64/bin/java 2>/dev/null | tail -1)
+              if [ -n "$CACHED" ] && [ -x "$CACHED" ]; then
+                JAVA25="$CACHED"
+                echo "[altvm] using the toolcache JDK $JAVA25"
+              fi
+            fi
             if [ ! -x "$JAVA25" ]; then
               URL=$(curl -s --max-time 60 "https://api.github.com/repos/graalvm/graalvm-ce-builds/releases?per_page=60" \
                 | python3 -c '
           import json, sys
           try:
               releases = json.load(sys.stdin)
-          except Exception:
+          except Exception as error:
+              print("feed error: %s" % error, file=sys.stderr)
               sys.exit(0)
           for release in releases:
               if not release.get("tag_name", "").startswith("jdk-25"):
@@ -356,24 +366,25 @@ jobs:
                       sys.exit(0)
           ')
               if [ -z "$URL" ]; then
-                echo "[altvm] skipped: no GraalVM Community JDK 25 archive advertised by the release feed"
-                exit 0
+                echo "[altvm] skipped: no GraalVM Community JDK 25 linux-x64 archive in the release feed"
+                return 0
               fi
               echo "[altvm] downloading $URL"
-              mkdir -p "$GRAAL_DIR"
-              if ! curl -sL --max-time 900 "$URL" -o /tmp/graalvm25.tar.gz; then
-                echo "[altvm] skipped: download failed"
-                exit 0
+              mkdir -p /tmp/graalvm25
+              if ! curl -fsSL --retry 2 --max-time 900 "$URL" -o /tmp/graalvm25.tar.gz; then
+                echo "[altvm] skipped: download failed ($URL)"
+                return 0
               fi
-              if ! tar -xzf /tmp/graalvm25.tar.gz -C "$GRAAL_DIR" --strip-components=1; then
+              echo "[altvm] archive: $(du -h /tmp/graalvm25.tar.gz | cut -f1)"
+              if ! tar -xzf /tmp/graalvm25.tar.gz -C /tmp/graalvm25 --strip-components=1; then
                 echo "[altvm] skipped: extraction failed"
-                exit 0
+                return 0
               fi
             fi
             "$JAVA25" -version 2>&1 | head -3
             if ! "$JAVA25" -version 2>&1 | grep -qi graalvm; then
               echo "[altvm] skipped: the downloaded JDK does not report itself as GraalVM"
-              exit 0
+              return 0
             fi
 
             CP="$(cat "$CP_FILE"):leaf-server/build/classes/java/test:leaf-server/build/resources/test"
@@ -413,16 +424,19 @@ jobs:
           JAVA
             # a 21 class file runs unchanged on 25, and the build JDK is the one on PATH here
             if ! javac -nowarn -cp "$(cat "$CP_FILE")" -d /tmp/altrun /tmp/altrun/AltVmRunner.java 2>/tmp/altrun/javac.log; then
-              echo "[altvm] skipped: runner did not compile"
+              echo "[altvm] skipped: the runner did not compile"
               tail -20 /tmp/altrun/javac.log
-              exit 0
+              return 0
             fi
             "$JAVA25" -XX:+UnlockExperimentalVMOptions -XX:+UseCompactObjectHeaders \
               -cp "/tmp/altrun:$CP" AltVmRunner 2>&1 | grep -v 'unknown enum constant' | tail -60
             echo "[altvm] exit code: ${PIPESTATUS[0]}"
-          } >> "$OUT" 2>&1
+            return 0
+          }
+
+          { echo "### GraalVM 25 proof (non blocking)"; probe; } >> "$OUT" 2>&1
           cat "$OUT"
-          cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then cat "$OUT" >> "$GITHUB_STEP_SUMMARY"; fi
           python3 - "$OUT" <<'PYEOF'
           import sys
           lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
