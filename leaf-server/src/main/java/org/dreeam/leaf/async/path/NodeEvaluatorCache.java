@@ -32,6 +32,9 @@ public class NodeEvaluatorCache {
     private static final int MAX_FEATURE_SETS =
         Integer.getInteger("leaf.pathfinding.maxCachedFeatureSets", 32);
 
+    /** Leaf - a parked evaluator holds the node arrays of its last search, tens of kilobytes */
+    private static final long ESTIMATED_BYTES_PER_EVALUATOR = 24L * 1024L;
+
     private static final Map<NodeEvaluatorFeatures, MultiThreadedQueue<NodeEvaluator>> threadLocalNodeEvaluators = new ConcurrentHashMap<>();
     private static final Map<NodeEvaluator, NodeEvaluatorGenerator> nodeEvaluatorToGenerator = new ConcurrentHashMap<>();
 
@@ -39,6 +42,8 @@ public class NodeEvaluatorCache {
     private static final AtomicLong cachedEvaluators = new AtomicLong();
     /** evaluators dropped because their queue was full */
     private static final AtomicLong droppedEvaluators = new AtomicLong();
+    /** evaluations that were served from the pool instead of building a fresh evaluator */
+    private static final AtomicLong reuseHits = new AtomicLong();
 
     private static @NotNull MultiThreadedQueue<NodeEvaluator> getQueueForFeatures(@NotNull NodeEvaluatorFeatures nodeEvaluatorFeatures) {
         return threadLocalNodeEvaluators.computeIfAbsent(nodeEvaluatorFeatures, key -> new MultiThreadedQueue<>());
@@ -52,6 +57,7 @@ public class NodeEvaluatorCache {
             nodeEvaluator = generator.generate(nodeEvaluatorFeatures);
         } else {
             cachedEvaluators.decrementAndGet();
+            reuseHits.incrementAndGet(); // Leaf - hit accounting for the RAM janitor
         }
 
         nodeEvaluatorToGenerator.put(nodeEvaluator, generator);
@@ -82,6 +88,67 @@ public class NodeEvaluatorCache {
 
     public static void removeNodeEvaluator(@NotNull NodeEvaluator nodeEvaluator) {
         nodeEvaluatorToGenerator.remove(nodeEvaluator);
+    }
+
+    /**
+     * @return the number of idle evaluators currently parked in the pool
+     */
+    public static int parkedEvaluators() {
+        final long parked = cachedEvaluators.get();
+        return (int) Math.min(Integer.MAX_VALUE, Math.max(0L, parked));
+    }
+
+    /**
+     * @return the estimated heap held by the parked evaluators
+     */
+    public static long estimatedBytes() {
+        return (long) parkedEvaluators() * ESTIMATED_BYTES_PER_EVALUATOR;
+    }
+
+    /**
+     * @return how many path searches were served from the pool, used as the janitor's hit counter
+     */
+    public static long reuseHits() {
+        return reuseHits.get();
+    }
+
+    /**
+     * Leaf - drop a share of the parked evaluators.
+     * <p>
+     * An evaluator is a cache entry, not a resource: dropping one means the next search builds a fresh
+     * one, which is exactly what would have happened on a pool miss. The pool is a queue per feature
+     * combination, so the shed walks those queues and discards the entries at their head.
+     *
+     * @param ratio  share of the parked evaluators to drop, {@code (0, 1]}
+     * @param dryRun when {@code true} only the effect is estimated
+     * @return the estimated heap bytes released, assuming the node arrays of the last search
+     */
+    public static long trim(final double ratio, final boolean dryRun) {
+        final int parked = parkedEvaluators();
+        if (parked <= 0 || ratio <= 0.0D) {
+            return 0L;
+        }
+        final int target = Math.max(1, (int) Math.round(parked * Math.min(1.0D, ratio)));
+        if (dryRun) {
+            return (long) target * ESTIMATED_BYTES_PER_EVALUATOR;
+        }
+
+        int dropped = 0;
+        for (final MultiThreadedQueue<NodeEvaluator> queue : threadLocalNodeEvaluators.values()) {
+            if (dropped >= target) {
+                break;
+            }
+            while (dropped < target) {
+                final NodeEvaluator evaluator = queue.poll();
+                if (evaluator == null) {
+                    break;
+                }
+                cachedEvaluators.decrementAndGet();
+                droppedEvaluators.incrementAndGet();
+                dropped++;
+            }
+        }
+        return (long) dropped * ESTIMATED_BYTES_PER_EVALUATOR;
     }
 
     /**

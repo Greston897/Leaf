@@ -174,6 +174,46 @@ public final class OffHeapChunkPayloadCache {
         this.usedBytes.set(0L);
     }
 
+    /**
+     * Leaf - shed a share of the payloads, used by the RAM janitor when the heap or the native pools are
+     * under pressure.
+     * <p>
+     * The cache is weight bounded, so the cheapest way to force Caffeine to evict its least recently
+     * used tail is to lower {@code maximumWeight} for the duration of one maintenance pass and raise it
+     * back afterwards. Evicted entries are <b>not</b> reloaded when the limit is restored - the point of
+     * a cache is that it refills on demand.
+     *
+     * @param ratio  share of the current budget to give up, {@code (0, 1]}
+     * @param dryRun when {@code true} only the effect is estimated
+     * @return the estimated number of native bytes released
+     */
+    public long trim(final double ratio, final boolean dryRun) {
+        final long before = this.usedBytes();
+        if (before <= 0L || ratio <= 0.0D) {
+            return 0L;
+        }
+        final double share = Math.min(1.0D, ratio);
+        if (dryRun) {
+            return (long) (before * share);
+        }
+        try {
+            final long target = Math.max(1L, this.budgetBytes - (long) (this.budgetBytes * share));
+            this.entries.policy().eviction().ifPresent(eviction -> {
+                final long configured = eviction.getMaximum();
+                eviction.setMaximum(Math.min(configured, target));
+                this.entries.cleanUp();
+                // restore the configured ceiling: the evicted entries stay evicted, the cache refills
+                // on demand, and the next pass can shave another slice
+                eviction.setMaximum(configured);
+            });
+            this.entries.cleanUp();
+        } catch (Throwable ignored) {
+            // a weight bound that cannot be lowered is not worth a broken pass
+            return 0L;
+        }
+        return Math.max(0L, before - this.usedBytes());
+    }
+
     public long usedBytes() {
         return Math.max(0L, this.usedBytes.get());
     }

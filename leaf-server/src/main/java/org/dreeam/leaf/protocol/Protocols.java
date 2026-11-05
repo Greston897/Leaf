@@ -50,6 +50,9 @@ public class Protocols {
     }
 
     public static void tickServer(MinecraftServer server) {
+        // Leaf start - RAM janitor: pressure driven cache trimming, once per tick
+        org.dreeam.leaf.perf.ram.LeafRam.tickServer(server);
+        // Leaf end - RAM janitor
         for (Protocol protocol : PROTOCOLS) {
             protocol.tickServer(server);
         }
@@ -62,6 +65,9 @@ public class Protocols {
     }
 
     public static void disconnected(ServerPlayer conn) {
+        // Leaf start - drop everything the server still holds about this player
+        org.dreeam.leaf.perf.ram.LeafRam.playerLeft(conn);
+        // Leaf end - player data cleanup
         for (Protocol protocol : PROTOCOLS) {
             protocol.disconnected(conn);
         }

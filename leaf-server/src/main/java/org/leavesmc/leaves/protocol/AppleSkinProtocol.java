@@ -15,6 +15,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 @LeavesProtocol(namespace = "appleskin")
 public class AppleSkinProtocol {
@@ -114,6 +115,62 @@ public class AppleSkinProtocol {
         for (ServerPlayer player : MinecraftServer.getServer().getPlayerList().getPlayers()) {
             onPlayerLoggedOut(player);
         }
+    }
+
+    /**
+     * Leaf - drop everything about one player on the quit path.
+     *
+     * @return the number of entries that were dropped
+     */
+    public static int forget(final @NotNull ServerPlayer player) {
+        int dropped = 0;
+        if (subscribedChannels.remove(player) != null) {
+            dropped++;
+        }
+        if (previousSaturationLevels.remove(player) != null) {
+            dropped++;
+        }
+        if (previousExhaustionLevels.remove(player) != null) {
+            dropped++;
+        }
+        if (previousNaturalRegeneration.remove(player) != null) {
+            dropped++;
+        }
+        return dropped;
+    }
+
+    /**
+     * Leaf - drop everything about one player, keyed only by the UUID. Used by the janitor's stale sweep,
+     * which runs after the fact and no longer has the object.
+     *
+     * @return the number of entries that were dropped
+     */
+    public static int forget(final @NotNull UUID playerId) {
+        final int before = entryCount();
+        subscribedChannels.keySet().removeIf(key -> key.getUUID().equals(playerId));
+        previousSaturationLevels.keySet().removeIf(key -> key.getUUID().equals(playerId));
+        previousExhaustionLevels.keySet().removeIf(key -> key.getUUID().equals(playerId));
+        previousNaturalRegeneration.keySet().removeIf(key -> key.getUUID().equals(playerId));
+        return before - entryCount();
+    }
+
+    /**
+     * Leaf - the players this protocol still remembers, for the janitor's stale sweep.
+     */
+    public static Set<UUID> trackedPlayers() {
+        final Set<UUID> ids = new HashSet<>();
+        for (final ServerPlayer player : subscribedChannels.keySet()) {
+            ids.add(player.getUUID());
+        }
+        for (final ServerPlayer player : previousSaturationLevels.keySet()) {
+            ids.add(player.getUUID());
+        }
+        return ids;
+    }
+
+    private static int entryCount() {
+        return subscribedChannels.size() + previousSaturationLevels.size()
+            + previousExhaustionLevels.size() + previousNaturalRegeneration.size();
     }
 
     private static void resetPlayerData(@NotNull ServerPlayer player) {

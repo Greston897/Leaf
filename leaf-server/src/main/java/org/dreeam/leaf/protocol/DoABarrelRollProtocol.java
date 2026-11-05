@@ -54,9 +54,12 @@ public class DoABarrelRollProtocol implements Protocol {
     public final Reference2FloatMap<ServerGamePacketListenerImpl> lastRollMap = Reference2FloatMaps.synchronize(new Reference2FloatOpenHashMap<>());
 
     public static void deinit() {
-        if (INSTANCE != null) {
+        final DoABarrelRollProtocol instance = INSTANCE;
+        if (instance != null) {
+            // Leaf - clear the field first, but unregister the instance that was actually registered:
+            // unregistering the already nulled field left the protocol in the list for good
             INSTANCE = null;
-            Protocols.unregister(INSTANCE);
+            Protocols.unregister(instance);
         }
     }
 
@@ -121,12 +124,53 @@ public class DoABarrelRollProtocol implements Protocol {
 
     @Override
     public void disconnected(ServerPlayer player) {
-        final var handler = player.connection;
-        syncStates.remove(handler);
-        isRollingMap.removeBoolean(handler);
-        rollMap.removeFloat(handler);
-        lastIsRollingMap.removeBoolean(handler);
-        lastRollMap.removeFloat(handler);
+        forget(player);
+    }
+
+    /**
+     * Leaf - drop every piece of state this protocol holds for one player.
+     * <p>
+     * The maps are keyed by the connection rather than by the UUID because the tick path already has the
+     * connection and a map lookup by UUID would box, but that means <b>every</b> map has to be cleaned by
+     * hand - and {@code scheduledKicks} used to be missed, which kept a pending kick (and through it the
+     * whole connection) alive after the player was gone. Cleaning is now one method, called both from the
+     * disconnect hook and from the RAM janitor's player data purge.
+     *
+     * @return the number of entries that were dropped
+     */
+    public static int forget(final ServerPlayer player) {
+        final DoABarrelRollProtocol instance = INSTANCE;
+        if (player == null || instance == null) {
+            return 0;
+        }
+        final ServerGamePacketListenerImpl handler = player.connection;
+        if (handler == null) {
+            return 0;
+        }
+        int dropped = 0;
+        if (instance.syncStates.remove(handler) != null) {
+            dropped++;
+        }
+        if (instance.scheduledKicks.remove(handler) != null) {
+            dropped++;
+        }
+        if (instance.isRollingMap.containsKey(handler)) {
+            instance.isRollingMap.removeBoolean(handler);
+            dropped++;
+        }
+        if (instance.rollMap.containsKey(handler)) {
+            instance.rollMap.removeFloat(handler);
+            dropped++;
+        }
+        if (instance.lastIsRollingMap.containsKey(handler)) {
+            instance.lastIsRollingMap.removeBoolean(handler);
+            dropped++;
+        }
+        if (instance.lastRollMap.containsKey(handler)) {
+            instance.lastRollMap.removeFloat(handler);
+            dropped++;
+        }
+        return dropped;
     }
 
     @Override

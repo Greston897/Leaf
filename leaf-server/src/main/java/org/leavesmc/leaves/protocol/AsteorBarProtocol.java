@@ -50,6 +50,39 @@ public class AsteorBarProtocol {
         resetPlayerData(player);
     }
 
+    /**
+     * Leaf - drop everything about one player on the quit path.
+     *
+     * @return the number of entries that were dropped
+     */
+    public static int forget(final @NotNull ServerPlayer player) {
+        players.remove(player);
+        return forget(player.getUUID());
+    }
+
+    /**
+     * Leaf - drop the cached levels of one player, keyed only by the UUID (janitor stale sweep).
+     *
+     * @return the number of entries that were dropped
+     */
+    public static int forget(final @NotNull UUID playerId) {
+        int dropped = 0;
+        if (previousSaturationLevels.remove(playerId) != null) {
+            dropped++;
+        }
+        if (previousExhaustionLevels.remove(playerId) != null) {
+            dropped++;
+        }
+        return dropped;
+    }
+
+    /**
+     * Leaf - the players this protocol still remembers, for the janitor's stale sweep.
+     */
+    public static Set<UUID> trackedPlayers() {
+        return new HashSet<>(previousSaturationLevels.keySet());
+    }
+
     @ProtocolHandler.MinecraftRegister(ignoreId = true)
     public static void onPlayerSubscribed(@NotNull ServerPlayer player) {
         players.add(player);

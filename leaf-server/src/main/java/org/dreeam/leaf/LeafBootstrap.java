@@ -61,6 +61,11 @@ public class LeafBootstrap {
             // async pathfinding may be disabled, the pool then was never touched
         }
         try {
+            System.out.println("[Leaf] RAM janitor: " + org.dreeam.leaf.perf.ram.LeafRam.shutdownReport());
+        } catch (Throwable ignored) {
+            // the janitor was never installed, the feature is disabled or the server ran for a moment
+        }
+        try {
             System.out.println("[Leaf] Rail traversal pool: "
                 + org.dreeam.leaf.world.block.OptimizedPoweredRails.trackedPositions() + " tracked positions");
         } catch (Throwable ignored) {

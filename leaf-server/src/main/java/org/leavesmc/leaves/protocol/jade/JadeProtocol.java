@@ -82,6 +82,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 
 @LeavesProtocol(namespace = "jade")
 public class JadeProtocol {
@@ -177,6 +178,37 @@ public class JadeProtocol {
     @ProtocolHandler.PlayerLeave
     public static void onPlayerLeave(ServerPlayer player) {
         enabledPlayers.remove(player);
+    }
+
+    /**
+     * Leaf - drop the per-player state on the quit path.
+     *
+     * @return the number of entries that were dropped
+     */
+    public static int forget(final @NotNull ServerPlayer player) {
+        return enabledPlayers.remove(player) ? 1 : 0;
+    }
+
+    /**
+     * Leaf - drop the per-player state keyed only by the UUID (janitor stale sweep).
+     *
+     * @return the number of entries that were dropped
+     */
+    public static int forget(final @NotNull UUID playerId) {
+        final int before = enabledPlayers.size();
+        enabledPlayers.removeIf(player -> player.getUUID().equals(playerId));
+        return before - enabledPlayers.size();
+    }
+
+    /**
+     * Leaf - the players this protocol still remembers, for the janitor's stale sweep.
+     */
+    public static Set<UUID> trackedPlayers() {
+        final Set<UUID> ids = new HashSet<>();
+        for (final ServerPlayer player : enabledPlayers) {
+            ids.add(player.getUUID());
+        }
+        return ids;
     }
 
     @ProtocolHandler.PayloadReceiver(payload = RequestEntityPayload.class, payloadId = "request_entity")
