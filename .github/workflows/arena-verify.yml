@@ -411,7 +411,7 @@ jobs:
                       + System.getProperty("java.vm.version") + " / JDK "
                       + System.getProperty("java.specification.version"));
                   System.out.println("[altvm] jvm args: "
-                      + java.util.stream.Collectors.joining(" ", java.lang.management.ManagementFactory
+                      + String.join(" ", java.lang.management.ManagementFactory
                           .getRuntimeMXBean().getInputArguments()));
                   System.out.println("[altvm] tests started " + summary.getTestsStartedCount()
                       + ", succeeded " + summary.getTestsSucceededCount()
