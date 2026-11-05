@@ -5,6 +5,7 @@ import joptsimple.OptionSet;
 import org.dreeam.leaf.perf.CpuFeatures;
 import org.dreeam.leaf.perf.JvmFlagAdvisor;
 import org.dreeam.leaf.perf.LeafRuntimeTuning;
+import org.dreeam.leaf.perf.MemoryFootprint;
 
 public class LeafBootstrap {
 
@@ -18,6 +19,9 @@ public class LeafBootstrap {
         // Leaf start - boot time tuning (must run before Netty / sun.nio.ch are initialised)
         LeafRuntimeTuning.apply();
         JvmFlagAdvisor.printAdvice();
+        // Boot and shutdown snapshot of heap / metaspace / direct memory / RSS and of the jar
+        // directories, so "where did the 2 GB go" is answered with numbers.
+        MemoryFootprint.install();
         // Only does something when -Dleaf.offHeap.chunkCacheMB is set.
         org.dreeam.leaf.perf.offheap.OffHeapChunkPayloadCache.installShutdownReport();
         // Leaf end - boot time tuning

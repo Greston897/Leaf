@@ -144,6 +144,50 @@ jobs:
           scripts/ci/publish-excerpts.sh method BP-WITHIN "$ROOT/net/minecraft/core/BlockPos.java" 'Iterable<BlockPos> withinManhattan' 55
           scripts/ci/publish-excerpts.sh method BP-BETWEEN "$ROOT/net/minecraft/core/BlockPos.java" 'Iterable<BlockPos> betweenClosed(AABB' 30
 
+      - name: Find the plugin and library loader sources
+        if: always()
+        run: |
+          set +e
+          OUT=/tmp/loaders.txt
+          {
+            echo "### files matching *LibraryLoader*"
+            find . -name '*LibraryLoader*.java' -not -path './.git/*' 2>/dev/null | head -20
+            echo "### plugin loading tree (io/papermc/paper/plugin)"
+            find . -path '*io/papermc/paper/plugin*' -name '*.java' -not -path './.git/*' 2>/dev/null | head -60
+            echo "### maven resolver / library util classes"
+            find . \( -name '*MavenLibraryResolver*.java' -o -name '*PluginJar*.java' \) -not -path './.git/*' 2>/dev/null | head -20
+          } > "$OUT"
+          cat "$OUT"
+          python3 - "$OUT" <<'PYEOF'
+          import sys
+          data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          limit = 3500
+          chunks = [data[i:i + limit] for i in range(0, len(data), limit)] or [""]
+          for index, chunk in enumerate(chunks[:6], start=1):
+              escaped = chunk.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+              print(f"::error title=LOADERS-{index}-OF-{len(chunks)}::{escaped}")
+          PYEOF
+
+      - name: Excerpt - library loaders
+        if: always()
+        run: |
+          set +e
+          for file in $(find . -name '*LibraryLoader*.java' -not -path './.git/*' 2>/dev/null | head -3); do
+            name="$(basename "$file" .java | tr 'a-z' 'A-Z')"
+            echo "== $file"
+            scripts/ci/publish-excerpts.sh range "LOADER-$name" "$file" 1 400
+          done
+
+      - name: Excerpt - spigot plugin provider and class loader
+        if: always()
+        run: |
+          set +e
+          for pattern in SpigotPluginProvider SpigotPluginParent PluginClassLoader PaperPluginParent; do
+            file="$(find . -name "$pattern.java" -not -path './.git/*' 2>/dev/null | head -1)"
+            [ -n "$file" ] || continue
+            scripts/ci/publish-excerpts.sh range "LOADER-$pattern" "$file" 1 400
+          done
+
       - name: Report the test task configuration
         if: always()
         run: |
