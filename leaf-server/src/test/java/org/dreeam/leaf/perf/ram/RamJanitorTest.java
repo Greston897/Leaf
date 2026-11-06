@@ -23,8 +23,9 @@ class RamJanitorTest {
     private static final long MIB = 1024L * 1024L;
     private static final long MAX = 1000L * MIB;
 
-    private long now;
-    private final LongSupplier clock = () -> now;
+    /** the fake clock, shared with the caches so a trim can make the pass run out of budget */
+    private final long[] clockNow = {0L};
+    private final LongSupplier clock = () -> clockNow[0];
 
     private static final class FakeCache implements Trimmable {
 
@@ -38,6 +39,7 @@ class RamJanitorTest {
         private double lastRatio;
         private boolean lastDryRun;
         private long nanosPerTrim;
+        private long[] clockNow;
 
         private FakeCache(final String id, final long bytes, final int entries, final boolean expensive) {
             this.id = id;
@@ -71,8 +73,8 @@ class RamJanitorTest {
             trimCalls++;
             lastRatio = ratio;
             lastDryRun = dryRun;
-            if (nanosPerTrim > 0L) {
-                now += nanosPerTrim;
+            if (nanosPerTrim > 0L && clockNow != null) {
+                clockNow[0] += nanosPerTrim;
             }
             final long released = (long) (bytes * Math.min(1.0D, ratio));
             if (!dryRun) {
@@ -143,6 +145,7 @@ class RamJanitorTest {
         for (int i = 0; i < 4; i++) {
             final FakeCache cache = new FakeCache("cache-" + i, 100L * MIB, 10, false);
             cache.nanosPerTrim = 5_000_000L; // 5 ms per trim, budget is 2 ms
+            cache.clockNow = clockNow;
             janitor.register(cache);
         }
 
@@ -189,7 +192,7 @@ class RamJanitorTest {
         assertNotNull(janitor.tick(1L, 800L * MIB, MAX, 5.0D, 0L));
         final int callsAfterFirstPass = cache.trimCalls;
 
-        now += 30_000_000_000L; // the cooldown is over
+        clockNow[0] += 30_000_000_000L; // the cooldown is over
         // the pass left the heap at 70 %; 5 MiB above that is not a reason to trim again
         assertNull(janitor.tick(2L, 705L * MIB, MAX, 5.0D, 0L));
         assertEquals(callsAfterFirstPass, cache.trimCalls);
