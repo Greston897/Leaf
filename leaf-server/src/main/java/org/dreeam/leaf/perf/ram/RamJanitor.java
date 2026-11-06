@@ -216,7 +216,7 @@ public final class RamJanitor {
         return run(0L, usedBytes, maxBytes, dryRun ? "dry-run" : "manual", dryRun);
     }
 
-    private long run(final long tick, final long usedBytes, final long maxBytes, final String trigger,
+    private Pass run(final long tick, final long usedBytes, final long maxBytes, final String trigger,
                      final boolean dryRun) {
         final long start = clock.getAsLong();
         scratch.setLength(0);
