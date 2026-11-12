@@ -86,6 +86,13 @@ public class BufferedLinearRegionFile implements IRegionFile {
     private final LinearMasterFileParser masterFileParser = new LinearMasterFileParser();
     private final CompressingOps compressingOps = new CompressingOps();
 
+    // Leaf - Rust-style memory discipline: pooled direct buffers for all hot
+    // chunk I/O paths instead of megabyte-scale heap garbage per chunk.
+    // Every buffer handed out here returns to the pool exactly once (RAII
+    // lease / finally-release), so steady-state saving and loading allocates
+    // nothing on the Java heap. Gameplay-affecting logic is untouched.
+    private static final org.dreeam.leaf.util.mem.BufferPool CHUNK_IO_BUFFERS = new org.dreeam.leaf.util.mem.BufferPool();
+
     // managed by VarHandles following
     private boolean closed = false;
     private boolean beingSynced = false;
@@ -284,21 +291,23 @@ public class BufferedLinearRegionFile implements IRegionFile {
     }
 
     private void writeSwapFileHeaders(boolean forceFile, boolean forceMeta) throws IOException {
-        final ByteBuffer buffer = ByteBuffer.allocate(this.headerSize());
+        try (org.dreeam.leaf.util.mem.BufferPool.Lease lease = CHUNK_IO_BUFFERS.lease(this.headerSize())) { // Leaf - pooled direct buffer
+            final ByteBuffer buffer = lease.buffer();
 
-        buffer.putLong(SWAP_FILE_SUPER_BLOCK); // Magic
-        buffer.put(SWAP_FILE_VERSION); // Version
-        buffer.putInt(this.xxHash32Seed); // XXHash32 seed
-        buffer.putLong(this.currentAcquiredIndex); // Acquired index
+            buffer.putLong(SWAP_FILE_SUPER_BLOCK); // Magic
+            buffer.put(SWAP_FILE_VERSION); // Version
+            buffer.putInt(this.xxHash32Seed); // XXHash32 seed
+            buffer.putLong(this.currentAcquiredIndex); // Acquired index
 
-        for (Sector sector : this.sectors) {
-            // encode each sector
-            buffer.put(sector.getEncoded());
+            for (Sector sector : this.sectors) {
+                // encode each sector
+                buffer.put(sector.getEncoded());
+            }
+
+            buffer.flip();
+
+            writeFullyAt(this.swapFileChannel, buffer, 0);
         }
-
-        buffer.flip();
-
-        writeFullyAt(this.swapFileChannel, buffer, 0);
 
         if (forceFile) {
             this.swapFileChannel.force(forceMeta);
@@ -536,6 +545,7 @@ public class BufferedLinearRegionFile implements IRegionFile {
             }
         } finally {
             this.regionObjectLock.writeLock().unlock();
+            CHUNK_IO_BUFFERS.release(committed); // Leaf - return pooled buffer deterministically
         }
 
         if (skipSync) {
@@ -565,7 +575,11 @@ public class BufferedLinearRegionFile implements IRegionFile {
             this.regionObjectLock.readLock().unlock();
         }
 
-        return this.compressingOps.decompress(raw);
+        try {
+            return this.compressingOps.decompress(raw);
+        } finally {
+            CHUNK_IO_BUFFERS.release(raw); // Leaf - return pooled buffer deterministically
+        }
     }
 
     private void clearChunkData(int index) throws IOException {
@@ -616,15 +630,18 @@ public class BufferedLinearRegionFile implements IRegionFile {
         data.position(oldPositionOfData);
 
         // uncompressed length(int) + timestamp(long) + xxhash32(int)
-        final ByteBuffer chunkSectionBuilder = ByteBuffer.allocate(data.remaining() + 4 + 8 + 4);
+        // Leaf - pooled direct buffer instead of a huge heap allocation per chunk
+        try (org.dreeam.leaf.util.mem.BufferPool.Lease lease = CHUNK_IO_BUFFERS.lease(data.remaining() + 4 + 8 + 4)) {
+            final ByteBuffer chunkSectionBuilder = lease.buffer();
 
-        chunkSectionBuilder.putInt(data.remaining()); // Length(int)
-        chunkSectionBuilder.putLong(System.currentTimeMillis()); // Timestamp(long)
-        chunkSectionBuilder.putInt(xxHash32OfData); // xxHash32 of the original data(int)
-        chunkSectionBuilder.put(data); // Data(bytes)
-        chunkSectionBuilder.flip();
+            chunkSectionBuilder.putInt(data.remaining()); // Length(int)
+            chunkSectionBuilder.putLong(System.currentTimeMillis()); // Timestamp(long)
+            chunkSectionBuilder.putInt(xxHash32OfData); // xxHash32 of the original data(int)
+            chunkSectionBuilder.put(data); // Data(bytes)
+            chunkSectionBuilder.flip();
 
-        this.writeChunkDataRaw(chunkIndex, chunkSectionBuilder, false);
+            this.writeChunkDataRaw(chunkIndex, chunkSectionBuilder, false);
+        }
     }
 
     private @Nullable ByteBuffer readChunk(int x, int z) throws IOException {
@@ -788,7 +805,8 @@ public class BufferedLinearRegionFile implements IRegionFile {
 
         public @NotNull ByteBuffer compress(@NotNull ByteBuffer in) {
             final int bufferLenToAllocate = this.lz4Compressor.maxCompressedLength(in.remaining());
-            final ByteBuffer result = ByteBuffer.allocate(bufferLenToAllocate + 4);
+            // Leaf - pooled direct buffer; released by writeChunkDataRaw caller
+            final ByteBuffer result = CHUNK_IO_BUFFERS.acquire(bufferLenToAllocate + 4);
 
             result.putInt(in.remaining());
             this.lz4Compressor.compress(in, result);
@@ -831,7 +849,9 @@ public class BufferedLinearRegionFile implements IRegionFile {
         }
 
         public @NotNull ByteBuffer read(@NotNull FileChannel channel) throws IOException {
-            final ByteBuffer result = ByteBuffer.allocate((int) this.length);
+            // Leaf - pooled direct buffer; released by readChunkDataRaw caller
+            final ByteBuffer result = CHUNK_IO_BUFFERS.acquire((int) this.length);
+            result.limit((int) this.length); // pooled capacity may exceed the sector length
 
             readFullyAt(channel, result, this.offset);
 

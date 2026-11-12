@@ -9,10 +9,13 @@ public class VirtualThreadSupport extends ConfigModules {
         return EnumConfigCategory.PERF.getBaseKeyName() + ".use-virtual-thread";
     }
 
-    public static boolean bukkitAsyncScheduler = false;
-    public static boolean foliaAsyncScheduler = false;
+    // Leaf - enable all virtual thread executors by default: unbounded platform
+    // thread pools (CraftAsyncScheduler, Folia scheduler, downloads) are pure RAM
+    // and churn for zero gameplay benefit. Every toggle stays configurable.
+    public static boolean bukkitAsyncScheduler = true;
+    public static boolean foliaAsyncScheduler = true;
     public static boolean asyncChatExecutor = true;
-    public static boolean downloadPool = false;
+    public static boolean downloadPool = true;
     public static boolean authPool = true;
     public static boolean paperConfigurationPool = true;
 
