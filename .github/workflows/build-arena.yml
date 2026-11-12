@@ -46,15 +46,15 @@ jobs:
       - name: Prepare release
         run: |
           mv leaf-server/build/libs/*mojmap.jar leaf-${{ env.MC_VERSION }}-arena-b${{ env.BUILD_NUMBER }}.jar
-          cat > release_notes.md <<'EOF'
-          Arena build: off-heap memory discipline (Rust-style) for hot paths.
-
-          ## Changes
-          - New `org.dreeam.leaf.util.mem`: `TickArena` (bump arena over direct memory with scoped RAII cleanup), `RustyPool`, `BufferPool`, off-heap primitive lists. Zero GC churn primitives for tick paths.
-          - Region file I/O (luminol linear format): all chunk write/read/compress/header buffers are pooled **direct** buffers, deterministically released. Removes megabyte-scale heap garbage per chunk save and read.
-          - Virtual threads enabled by default for Bukkit/Folia async schedulers and the download pool: plugin async tasks no longer grow unbounded platform thread pools (less RAM, less churn). All toggles remain in `perf.use-virtual-thread.*`.
-          - No gameplay changes; nothing existing was duplicated.
-          EOF
+          {
+            echo "Arena build: off-heap memory discipline (Rust-style) for hot paths.";
+            echo "";
+            echo "## Changes";
+            echo "- New \`org.dreeam.leaf.util.mem\`: \`TickArena\` (bump arena over direct memory with scoped RAII cleanup), \`RustyPool\`, \`BufferPool\`, off-heap primitive lists. Zero-GC primitives for tick paths.";
+            echo "- Region file I/O (luminol linear format): all chunk write/read/compress/header buffers are pooled **direct** buffers, deterministically released. Removes megabyte-scale heap garbage per chunk save and read.";
+            echo "- Virtual threads enabled by default for Bukkit/Folia async schedulers and the download pool: plugin async tasks no longer grow unbounded platform thread pools (less RAM, less churn). All toggles remain in \`perf.use-virtual-thread.*\`.";
+            echo "- No gameplay changes; nothing existing was duplicated.";
+          } > release_notes.md
 
       - name: Release
         uses: softprops/action-gh-release@v2
