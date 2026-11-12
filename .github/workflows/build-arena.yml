@@ -42,3 +42,25 @@ jobs:
           name: leaf-paperclip
           path: leaf-server/build/libs/*mojmap.jar
           if-no-files-found: error
+
+      - name: Prepare release
+        run: |
+          mv leaf-server/build/libs/*mojmap.jar leaf-${{ env.MC_VERSION }}-arena-b${{ env.BUILD_NUMBER }}.jar
+          cat > release_notes.md <<'EOF'
+          Arena build: off-heap memory discipline (Rust-style) for hot paths.
+
+          ## Changes
+          - New `org.dreeam.leaf.util.mem`: `TickArena` (bump arena over direct memory with scoped RAII cleanup), `RustyPool`, `BufferPool`, off-heap primitive lists. Zero GC churn primitives for tick paths.
+          - Region file I/O (luminol linear format): all chunk write/read/compress/header buffers are pooled **direct** buffers, deterministically released. Removes megabyte-scale heap garbage per chunk save and read.
+          - Virtual threads enabled by default for Bukkit/Folia async schedulers and the download pool: plugin async tasks no longer grow unbounded platform thread pools (less RAM, less churn). All toggles remain in `perf.use-virtual-thread.*`.
+          - No gameplay changes; nothing existing was duplicated.
+          EOF
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Leaf ${{ env.MC_VERSION }} arena"
+          tag_name: "arena-${{ env.MC_VERSION }}-b${{ env.BUILD_NUMBER }}"
+          files: "leaf-${{ env.MC_VERSION }}-arena-b${{ env.BUILD_NUMBER }}.jar"
+          body_path: release_notes.md
+          target_commitish: ${{ github.sha }}
